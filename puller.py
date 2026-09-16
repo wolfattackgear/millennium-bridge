@@ -49,6 +49,16 @@ MAX_PAGES       = int(env("MAX_PAGES", "50"))
 HTTP_TIMEOUT    = int(env("HTTP_TIMEOUT", "60"))
 DRY_RUN         = env("DRY_RUN", "0") not in ("", "0", "false", "False")
 
+# Destino do estoque:
+#   "gist" (padrao) = fluxo INVERTIDO. Grava estoque.json num gist secreto; o
+#                     canal-ml (cron da HostGator) puxa de la. Nao passa pelo WAF.
+#   "push"          = modo antigo. POST direto em api/erp-estoque.php (barrado
+#                     pelo ModSecurity da HostGator quando roda de datacenter).
+SINK            = (env("SINK", "gist") or "gist").lower()
+GIST_ID         = env("GIST_ID")
+GIST_TOKEN      = env("GIST_TOKEN")
+GIST_FILE       = env("GIST_FILE", "estoque.json")
+
 
 def die(msg: str, code: int = 1):
     print(f"[bridge] ERRO: {msg}", flush=True)
@@ -226,6 +236,57 @@ def empurrar_para_canal(itens: list[dict]) -> None:
     print(f"[bridge] FIM. total_itens={total} enviados={enviados} dry_run={DRY_RUN}", flush=True)
 
 
+def gravar_no_gist(itens: list[dict]) -> None:
+    """Fluxo invertido: grava estoque.json num gist secreto via API do GitHub.
+    O canal-ml (cron da HostGator) puxa esse gist por HTTPS e aplica o estoque."""
+    if not GIST_ID:
+        die("configure GIST_ID (id do gist secreto).")
+    if not GIST_TOKEN:
+        die("configure GIST_TOKEN (PAT com escopo gist).")
+
+    feed = {
+        "gerado_em": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "vitrine": VITRINE,
+        "campo_saldo": SALDO_FIELD,
+        "total": len(itens),
+        "itens": itens,
+    }
+    conteudo = json.dumps(feed, ensure_ascii=False)
+
+    if DRY_RUN:
+        amostra = ", ".join(f"{x['codigo']}={x['estoque']}" for x in itens[:3])
+        print(f"[bridge] DRY-RUN: gravaria {len(itens)} itens no gist "
+              f"{GIST_ID} (amostra: {amostra})", flush=True)
+        return
+
+    payload = json.dumps({"files": {GIST_FILE: {"content": conteudo}}}).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.github.com/gists/{GIST_ID}",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {GIST_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "WolfBridge-Puller",
+        },
+        method="PATCH",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            status = r.status
+            r.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        die(f"GitHub recusou o update do gist (HTTP {e.code}): {body[:400]}")
+    except Exception as e:
+        die(f"falha de rede ao gravar o gist: {e}")
+
+    if status < 200 or status >= 300:
+        die(f"update do gist retornou HTTP {status}.")
+    print(f"[bridge] gist {GIST_ID} atualizado: {len(itens)} itens.", flush=True)
+
+
 def main():
     if not MILLENNIUM_URL or not MILLENNIUM_USER or not MILLENNIUM_PASS:
         die("configure MILLENNIUM_URL, MILLENNIUM_USER e MILLENNIUM_PASS.")
@@ -234,7 +295,7 @@ def main():
 
     print(
         f"[bridge] inicio. vitrine={VITRINE} campo_saldo={SALDO_FIELD} "
-        f"canal={CANAL_BASE or '(vazio)'} dry_run={DRY_RUN}",
+        f"sink={SINK} dry_run={DRY_RUN}",
         flush=True,
     )
     itens = puxar_estoque()
@@ -242,7 +303,11 @@ def main():
     if not itens:
         print("[bridge] nada para enviar (0 itens). Verifique vitrine/credenciais.", flush=True)
         return
-    empurrar_para_canal(itens)
+
+    if SINK == "push":
+        empurrar_para_canal(itens)
+    else:
+        gravar_no_gist(itens)
 
 
 if __name__ == "__main__":
