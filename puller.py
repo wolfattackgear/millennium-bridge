@@ -95,8 +95,11 @@ def http_post_json(url: str, payload: dict) -> tuple[int, dict, str]:
         data=body,
         headers={
             "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json",
+            "Accept": "application/json, text/plain, */*",
             "X-ERP-Token": ERP_PUSH_TOKEN,
+            # User-Agent de navegador: o ModSecurity da HostGator recusa (406)
+            # requisicoes com User-Agent de robo/Python (urllib padrao).
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WolfBridge/1.0",
         },
         method="POST",
     )
@@ -119,7 +122,11 @@ def http_post_json(url: str, payload: dict) -> tuple[int, dict, str]:
 def puxar_estoque() -> list[dict]:
     """Full pull do saldo de estoque da vitrine (CDC por trans_id, cursor comeca em 0)."""
     base = millennium_base()
-    headers = {"Authorization": basic_auth_header(), "Accept": "application/json"}
+    headers = {
+        "Authorization": basic_auth_header(),
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WolfBridge/1.0",
+    }
     cursor = 0
     itens: list[dict] = []
     seen: set[str] = set()
