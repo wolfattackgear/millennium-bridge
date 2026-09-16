@@ -1,0 +1,2 @@
+# Sem dependencias externas — usa apenas a stdlib do Python (urllib, json, base64).
+# Arquivo presente so para o Railway/Nixpacks detectar o projeto como Python.
