@@ -1,30 +1,40 @@
-name: Millennium puller
+name: Puxador Millennium -> gist
 
 on:
-  workflow_dispatch:        # botao "Run workflow" para testar na mao
+  workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * *'  # a cada 15 min
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: puller-millennium
+  cancel-in-progress: false
 
 jobs:
   puxar:
     runs-on: ubuntu-latest
     steps:
-      - name: Baixar o codigo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Instalar Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Rodar o puxador
+      - name: Rodar puxador
         env:
           MILLENNIUM_URL:  ${{ secrets.MILLENNIUM_URL }}
           MILLENNIUM_USER: ${{ secrets.MILLENNIUM_USER }}
           MILLENNIUM_PASS: ${{ secrets.MILLENNIUM_PASS }}
           VITRINE:         ${{ secrets.VITRINE }}
-          CANAL_BASE:      ${{ secrets.CANAL_BASE }}
-          ERP_PUSH_TOKEN:  ${{ secrets.ERP_PUSH_TOKEN }}
           SALDO_FIELD:     ${{ secrets.SALDO_FIELD }}
+          SINK:            gist
+          GIST_ID:         ${{ secrets.GIST_ID }}
+          GIST_TOKEN:      ${{ secrets.GIST_TOKEN }}
+          MAX_PAGES:       "50"
+          HTTP_TIMEOUT:    "60"
           DRY_RUN:         ${{ secrets.DRY_RUN }}
         run: python puller.py
