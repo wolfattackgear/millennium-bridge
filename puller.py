@@ -29,6 +29,8 @@ SALDO_FIELD     = env("SALDO_FIELD", "saldo")
 BATCH_SIZE      = int(env("BATCH_SIZE", "300"))
 MAX_PAGES       = int(env("MAX_PAGES", "50"))
 HTTP_TIMEOUT    = int(env("HTTP_TIMEOUT", "60"))
+NET_RETRIES     = int(env("NET_RETRIES", "3"))
+NET_BACKOFF     = int(env("NET_BACKOFF", "5"))
 DRY_RUN         = env("DRY_RUN", "0") not in ("", "0", "false", "False")
 
 SINK            = (env("SINK", "gist") or "gist").lower()
@@ -96,16 +98,29 @@ def puxar_estoque() -> list[dict]:
             f"{base}/produtos/saldodeestoque"
             f"?vitrine={VITRINE}&trans_id={cursor}&$format=json"
         )
-        status, data, raw = http_get_json(url, headers)
-
-        if status == 0:
-            die(f"falha de rede no Millennium (pagina {page}): {raw}")
-        if status in (429, 500, 503) and "licen" in raw.lower():
-            print(f"[bridge] licenca ocupada (HTTP {status}), aguardando 3s...", flush=True)
-            time.sleep(3)
-            continue
-        if status < 200 or status >= 300:
-            die(f"HTTP {status} do Millennium (pagina {page}): {raw[:300]}")
+        tent_rede = 0
+        tent_lic = 0
+        while True:
+            status, data, raw = http_get_json(url, headers)
+            if status == 0:
+                if tent_rede < NET_RETRIES:
+                    tent_rede += 1
+                    print(f"[bridge] timeout/rede no Millennium (pagina {page}), "
+                          f"tentativa {tent_rede}/{NET_RETRIES}, aguardando {NET_BACKOFF}s...", flush=True)
+                    time.sleep(NET_BACKOFF)
+                    continue
+                die(f"falha de rede no Millennium (pagina {page}) apos {NET_RETRIES} tentativas: {raw}")
+            if status in (429, 500, 503) and "licen" in raw.lower():
+                if tent_lic < 5:
+                    tent_lic += 1
+                    print(f"[bridge] licenca ocupada (HTTP {status}), "
+                          f"tentativa {tent_lic}/5, aguardando 3s...", flush=True)
+                    time.sleep(3)
+                    continue
+                die(f"licenca do Millennium ocupada (pagina {page}) apos varias tentativas.")
+            if status < 200 or status >= 300:
+                die(f"HTTP {status} do Millennium (pagina {page}): {raw[:300]}")
+            break
 
         rows = data.get("value") or []
         if not rows:
@@ -192,8 +207,8 @@ def empurrar_para_canal(itens: list[dict]) -> None:
         die("ERP_PUSH_TOKEN nao configurado.")
 
     push_url = f"{CANAL_BASE}/api/erp-estoque.php"
-    origin = urllib.parse.urlsplit(push_url)
-    origin = f"{origin.scheme}://{origin.netloc}" if origin.scheme and origin.netloc else ""
+    p = urllib.parse.urlsplit(push_url)
+    origin = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else ""
     total = len(itens)
     enviados = 0
 
