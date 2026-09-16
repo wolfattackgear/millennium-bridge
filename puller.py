@@ -24,6 +24,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ------------------------- Config (env) -------------------------
@@ -88,21 +89,36 @@ def http_get_json(url: str, headers: dict) -> tuple[int, dict, str]:
     return status, data, body
 
 
+def _origin_de(url: str) -> str:
+    p = urllib.parse.urlsplit(url)
+    return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else ""
+
+
+# User-Agent de Chrome real. O ModSecurity da HostGator devolve 406 para
+# requisicoes que "parecem robo": User-Agent de Python/urllib OU faltando
+# cabecalhos que todo navegador manda (Accept-Language, Referer, Origin).
+# Testado: do navegador do usuario a mesma requisicao passa (401 token);
+# do datacenter, sem esses cabecalhos, apanha 406. Entao imitamos o browser.
+_UA_CHROME = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+
 def http_post_json(url: str, payload: dict) -> tuple[int, dict, str]:
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json, text/plain, */*",
-            "X-ERP-Token": ERP_PUSH_TOKEN,
-            # User-Agent de navegador: o ModSecurity da HostGator recusa (406)
-            # requisicoes com User-Agent de robo/Python (urllib padrao).
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WolfBridge/1.0",
-        },
-        method="POST",
-    )
+    origin = _origin_de(url)
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "X-ERP-Token": ERP_PUSH_TOKEN,
+        "User-Agent": _UA_CHROME,
+    }
+    if origin:
+        headers["Origin"] = origin
+        headers["Referer"] = origin + "/"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
             txt = r.read().decode("utf-8", "replace")
@@ -125,7 +141,7 @@ def puxar_estoque() -> list[dict]:
     headers = {
         "Authorization": basic_auth_header(),
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WolfBridge/1.0",
+        "User-Agent": _UA_CHROME,
     }
     cursor = 0
     itens: list[dict] = []
@@ -199,7 +215,7 @@ def empurrar_para_canal(itens: list[dict]) -> None:
         if status == 0:
             die(f"falha de rede no push canal-ml: {raw}")
         if status < 200 or status >= 300 or not data.get("ok"):
-            die(f"push canal-ml recusou (HTTP {status}): {raw[:300]}")
+            die(f"push canal-ml recusou (HTTP {status}): {raw[:800]}")
         enviados += len(lote)
         print(
             f"[bridge] lote {i//BATCH_SIZE+1}: {len(lote)} itens; "
