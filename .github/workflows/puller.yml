@@ -1,0 +1,30 @@
+name: Millennium puller
+
+on:
+  workflow_dispatch:        # botao "Run workflow" para testar na mao
+  schedule:
+    - cron: '*/15 * * * *'  # a cada 15 min
+
+jobs:
+  puxar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Rodar o puxador
+        env:
+          MILLENNIUM_URL:  ${{ secrets.MILLENNIUM_URL }}
+          MILLENNIUM_USER: ${{ secrets.MILLENNIUM_USER }}
+          MILLENNIUM_PASS: ${{ secrets.MILLENNIUM_PASS }}
+          VITRINE:         ${{ secrets.VITRINE }}
+          CANAL_BASE:      ${{ secrets.CANAL_BASE }}
+          ERP_PUSH_TOKEN:  ${{ secrets.ERP_PUSH_TOKEN }}
+          SALDO_FIELD:     ${{ secrets.SALDO_FIELD }}
+          DRY_RUN:         ${{ secrets.DRY_RUN }}
+        run: python puller.py
