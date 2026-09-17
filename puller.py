@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-Ponte Millennium -> canal-ml. Puxa o estoque do Millennium e (no modo padrao)
-grava num gist secreto; o canal-ml puxa desse gist pelo cron dele.
+Ponte Millennium -> canal-ml (roda no Railway como CRON JOB, stateless).
+
+Por que existe: a HostGator (onde roda o canal-ml) bloqueia saida na porta 6017
+do Millennium. O Railway alcanca a 6017 (a API do Millennium nao filtra por IP,
+so por usuario/senha). Entao este script roda no Railway, puxa o estoque do
+Millennium e empurra pro canal-ml pelos endpoints que ja existem.
+
+Fluxo (1 execucao, depois encerra):
+  1) GET {MILLENNIUM_URL}/produtos/saldodeestoque?vitrine=..&trans_id=..&$format=json
+     (Basic auth). Pagina avancando o trans_id ate esgotar. Full pull (stateless):
+     comeca em trans_id=0 toda vez -> nao precisa guardar cursor.
+  2) POST em lotes para {CANAL_BASE}/api/erp-estoque.php com { token, itens:[{codigo,estoque}] }.
+
+Config: 100% por variaveis de ambiente (nada de segredo no codigo). Ver README.
+Single-flight: como e um cron curto que encerra, nao ha 2 execucoes simultaneas
+batendo na licenca do Millennium.
 """
 
 import base64
@@ -13,26 +27,35 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# ------------------------- Config (env) -------------------------
 
 def env(name: str, default: str = "") -> str:
     return (os.environ.get(name, default) or "").strip()
 
-MILLENNIUM_URL  = env("MILLENNIUM_URL")
+MILLENNIUM_URL  = env("MILLENNIUM_URL")      # ex: http://rotaextrema.millenniumhosting.com.br:6017/api/millenium_eco
 MILLENNIUM_USER = env("MILLENNIUM_USER")
 MILLENNIUM_PASS = env("MILLENNIUM_PASS")
 VITRINE         = env("VITRINE", "0")
-CANAL_BASE      = env("CANAL_BASE").rstrip("/")
+CANAL_BASE      = env("CANAL_BASE").rstrip("/")   # ex: https://sistema.wolfattack.com.br/projeto/canal-ml
 ERP_PUSH_TOKEN  = env("ERP_PUSH_TOKEN")
 
+# Campo de saldo do Millennium a usar como estoque "real".
+# 'saldo' foi o usado no piloto PowerShell; o conector PHP usa
+# 'saldo_vitrine_sem_reserva'. Deixa configuravel pra decidir sem mexer no codigo.
 SALDO_FIELD     = env("SALDO_FIELD", "saldo")
 
 BATCH_SIZE      = int(env("BATCH_SIZE", "300"))
 MAX_PAGES       = int(env("MAX_PAGES", "50"))
 HTTP_TIMEOUT    = int(env("HTTP_TIMEOUT", "60"))
-NET_RETRIES     = int(env("NET_RETRIES", "3"))
-NET_BACKOFF     = int(env("NET_BACKOFF", "5"))
+NET_RETRIES     = int(env("NET_RETRIES", "3"))   # tentativas extras em timeout/rede
+NET_BACKOFF     = int(env("NET_BACKOFF", "5"))   # segundos de pausa entre tentativas
 DRY_RUN         = env("DRY_RUN", "0") not in ("", "0", "false", "False")
 
+# Destino do estoque:
+#   "gist" (padrao) = fluxo INVERTIDO. Grava estoque.json num gist secreto; o
+#                     canal-ml (cron da HostGator) puxa de la. Nao passa pelo WAF.
+#   "push"          = modo antigo. POST direto em api/erp-estoque.php (barrado
+#                     pelo ModSecurity da HostGator quando roda de datacenter).
 SINK            = (env("SINK", "gist") or "gist").lower()
 GIST_ID         = env("GIST_ID")
 GIST_TOKEN      = env("GIST_TOKEN")
@@ -46,8 +69,10 @@ def die(msg: str, code: int = 1):
 
 def millennium_base() -> str:
     u = MILLENNIUM_URL.rstrip("/")
+    # tolera config apontando pro /$help
     if u.endswith("/$help"):
         u = u[: -len("/$help")].rstrip("/")
+    # aceita host puro ou ja com /api/millenium_eco
     if "/api/" in u.lower():
         return u
     return u + "/api/millenium_eco"
@@ -67,7 +92,7 @@ def http_get_json(url: str, headers: dict) -> tuple[int, dict, str]:
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")
         status = e.code
-    except Exception as e:
+    except Exception as e:  # rede/timeout
         return 0, {}, f"net_error: {e}"
     try:
         data = json.loads(body)
@@ -76,13 +101,54 @@ def http_get_json(url: str, headers: dict) -> tuple[int, dict, str]:
     return status, data, body
 
 
+def _origin_de(url: str) -> str:
+    p = urllib.parse.urlsplit(url)
+    return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else ""
+
+
+# User-Agent de Chrome real. O ModSecurity da HostGator devolve 406 para
+# requisicoes que "parecem robo": User-Agent de Python/urllib OU faltando
+# cabecalhos que todo navegador manda (Accept-Language, Referer, Origin).
+# Testado: do navegador do usuario a mesma requisicao passa (401 token);
+# do datacenter, sem esses cabecalhos, apanha 406. Entao imitamos o browser.
 _UA_CHROME = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
 
+def http_post_json(url: str, payload: dict) -> tuple[int, dict, str]:
+    body = json.dumps(payload).encode("utf-8")
+    origin = _origin_de(url)
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "X-ERP-Token": ERP_PUSH_TOKEN,
+        "User-Agent": _UA_CHROME,
+    }
+    if origin:
+        headers["Origin"] = origin
+        headers["Referer"] = origin + "/"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            txt = r.read().decode("utf-8", "replace")
+            status = r.status
+    except urllib.error.HTTPError as e:
+        txt = e.read().decode("utf-8", "replace")
+        status = e.code
+    except Exception as e:
+        return 0, {}, f"net_error: {e}"
+    try:
+        data = json.loads(txt)
+    except Exception:
+        data = {}
+    return status, data, txt
+
+
 def puxar_estoque() -> list[dict]:
+    """Full pull do saldo de estoque da vitrine (CDC por trans_id, cursor comeca em 0)."""
     base = millennium_base()
     headers = {
         "Authorization": basic_auth_header(),
@@ -98,11 +164,14 @@ def puxar_estoque() -> list[dict]:
             f"{base}/produtos/saldodeestoque"
             f"?vitrine={VITRINE}&trans_id={cursor}&$format=json"
         )
+        # Tenta a pagina com retry: timeout/rede e "licenca ocupada" sao
+        # instabilidades curtas do Millennium -> espera e tenta de novo antes
+        # de desistir da rodada inteira.
         tent_rede = 0
         tent_lic = 0
         while True:
             status, data, raw = http_get_json(url, headers)
-            if status == 0:
+            if status == 0:  # timeout / erro de rede
                 if tent_rede < NET_RETRIES:
                     tent_rede += 1
                     print(f"[bridge] timeout/rede no Millennium (pagina {page}), "
@@ -120,9 +189,9 @@ def puxar_estoque() -> list[dict]:
                 die(f"licenca do Millennium ocupada (pagina {page}) apos varias tentativas.")
             if status < 200 or status >= 300:
                 die(f"HTTP {status} do Millennium (pagina {page}): {raw[:300]}")
-            break
+            break  # resposta OK -> sai do retry
 
-        rows = data.get("value") or []
+        rows = data.get("value") or []  # OData: itens vem em "value" (singular)
         if not rows:
             break
 
@@ -142,7 +211,15 @@ def puxar_estoque() -> list[dict]:
                 saldo = float(r.get(SALDO_FIELD) or 0)
             except (TypeError, ValueError):
                 saldo = 0.0
-            itens.append({"codigo": sku, "estoque": saldo})
+            item = {"codigo": sku, "estoque": saldo}
+            # codigo do produto (referencia usada na VTEX/ML) e o codigo de barras
+            ref = str(r.get("cod_produto") or "").strip()
+            ean = str(r.get("barra") or "").strip()
+            if ref:
+                item["ref"] = ref
+            if ean:
+                item["ean"] = ean
+            itens.append(item)
 
         if max_trans <= cursor:
             break
@@ -151,7 +228,42 @@ def puxar_estoque() -> list[dict]:
     return itens
 
 
+def empurrar_para_canal(itens: list[dict]) -> None:
+    if not CANAL_BASE:
+        die("CANAL_BASE nao configurado.")
+    if not ERP_PUSH_TOKEN:
+        die("ERP_PUSH_TOKEN nao configurado.")
+
+    push_url = f"{CANAL_BASE}/api/erp-estoque.php"
+    enviados = 0
+    total = len(itens)
+
+    for i in range(0, total, BATCH_SIZE):
+        lote = itens[i : i + BATCH_SIZE]
+        if DRY_RUN:
+            amostra = ", ".join(f"{x['codigo']}={x['estoque']}" for x in lote[:3])
+            print(f"[bridge] DRY-RUN lote {i//BATCH_SIZE+1}: {len(lote)} itens (amostra: {amostra})", flush=True)
+            enviados += len(lote)
+            continue
+
+        status, data, raw = http_post_json(push_url, {"token": ERP_PUSH_TOKEN, "itens": lote})
+        if status == 0:
+            die(f"falha de rede no push canal-ml: {raw}")
+        if status < 200 or status >= 300 or not data.get("ok"):
+            die(f"push canal-ml recusou (HTTP {status}): {raw[:800]}")
+        enviados += len(lote)
+        print(
+            f"[bridge] lote {i//BATCH_SIZE+1}: {len(lote)} itens; "
+            f"canal ok={data.get('ok')} enfileirados={data.get('enfileirados')}",
+            flush=True,
+        )
+
+    print(f"[bridge] FIM. total_itens={total} enviados={enviados} dry_run={DRY_RUN}", flush=True)
+
+
 def gravar_no_gist(itens: list[dict]) -> None:
+    """Fluxo invertido: grava estoque.json num gist secreto via API do GitHub.
+    O canal-ml (cron da HostGator) puxa esse gist por HTTPS e aplica o estoque."""
     if not GIST_ID:
         die("configure GIST_ID (id do gist secreto).")
     if not GIST_TOKEN:
@@ -198,55 +310,6 @@ def gravar_no_gist(itens: list[dict]) -> None:
     if status < 200 or status >= 300:
         die(f"update do gist retornou HTTP {status}.")
     print(f"[bridge] gist {GIST_ID} atualizado: {len(itens)} itens.", flush=True)
-
-
-def empurrar_para_canal(itens: list[dict]) -> None:
-    if not CANAL_BASE:
-        die("CANAL_BASE nao configurado.")
-    if not ERP_PUSH_TOKEN:
-        die("ERP_PUSH_TOKEN nao configurado.")
-
-    push_url = f"{CANAL_BASE}/api/erp-estoque.php"
-    p = urllib.parse.urlsplit(push_url)
-    origin = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else ""
-    total = len(itens)
-    enviados = 0
-
-    for i in range(0, total, BATCH_SIZE):
-        lote = itens[i : i + BATCH_SIZE]
-        if DRY_RUN:
-            enviados += len(lote)
-            continue
-        body = json.dumps({"token": ERP_PUSH_TOKEN, "itens": lote}).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-            "X-ERP-Token": ERP_PUSH_TOKEN,
-            "User-Agent": _UA_CHROME,
-        }
-        if origin:
-            headers["Origin"] = origin
-            headers["Referer"] = origin + "/"
-        req = urllib.request.Request(push_url, data=body, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-                txt = r.read().decode("utf-8", "replace")
-                status = r.status
-        except urllib.error.HTTPError as e:
-            txt = e.read().decode("utf-8", "replace")
-            status = e.code
-        except Exception as e:
-            die(f"falha de rede no push canal-ml: {e}")
-        try:
-            data = json.loads(txt)
-        except Exception:
-            data = {}
-        if status < 200 or status >= 300 or not data.get("ok"):
-            die(f"push canal-ml recusou (HTTP {status}): {txt[:800]}")
-        enviados += len(lote)
-
-    print(f"[bridge] FIM. total_itens={total} enviados={enviados} dry_run={DRY_RUN}", flush=True)
 
 
 def main():
