@@ -147,8 +147,9 @@ def http_post_json(url: str, payload: dict) -> tuple[int, dict, str]:
     return status, data, txt
 
 
-def puxar_estoque() -> list[dict]:
-    """Full pull do saldo de estoque da vitrine (CDC por trans_id, cursor comeca em 0)."""
+def _paginar(metodo: str):
+    """Gera todas as linhas de um metodo do Millennium, paginando por trans_id
+    (full pull: comeca em 0). Retry curto para timeout/rede e licenca ocupada."""
     base = millennium_base()
     headers = {
         "Authorization": basic_auth_header(),
@@ -156,17 +157,8 @@ def puxar_estoque() -> list[dict]:
         "User-Agent": _UA_CHROME,
     }
     cursor = 0
-    itens: list[dict] = []
-    seen: set[str] = set()
-
     for page in range(1, MAX_PAGES + 1):
-        url = (
-            f"{base}/produtos/saldodeestoque"
-            f"?vitrine={VITRINE}&trans_id={cursor}&$format=json"
-        )
-        # Tenta a pagina com retry: timeout/rede e "licenca ocupada" sao
-        # instabilidades curtas do Millennium -> espera e tenta de novo antes
-        # de desistir da rodada inteira.
+        url = f"{base}/{metodo}?vitrine={VITRINE}&trans_id={cursor}&$format=json"
         tent_rede = 0
         tent_lic = 0
         while True:
@@ -174,27 +166,26 @@ def puxar_estoque() -> list[dict]:
             if status == 0:  # timeout / erro de rede
                 if tent_rede < NET_RETRIES:
                     tent_rede += 1
-                    print(f"[bridge] timeout/rede no Millennium (pagina {page}), "
+                    print(f"[bridge] timeout/rede ({metodo} pag {page}), "
                           f"tentativa {tent_rede}/{NET_RETRIES}, aguardando {NET_BACKOFF}s...", flush=True)
                     time.sleep(NET_BACKOFF)
                     continue
-                die(f"falha de rede no Millennium (pagina {page}) apos {NET_RETRIES} tentativas: {raw}")
+                die(f"falha de rede no Millennium ({metodo} pag {page}) apos {NET_RETRIES} tentativas: {raw}")
             if status in (429, 500, 503) and "licen" in raw.lower():
                 if tent_lic < 5:
                     tent_lic += 1
-                    print(f"[bridge] licenca ocupada (HTTP {status}), "
+                    print(f"[bridge] licenca ocupada (HTTP {status}) em {metodo}, "
                           f"tentativa {tent_lic}/5, aguardando 3s...", flush=True)
                     time.sleep(3)
                     continue
-                die(f"licenca do Millennium ocupada (pagina {page}) apos varias tentativas.")
+                die(f"licenca do Millennium ocupada ({metodo} pag {page}) apos varias tentativas.")
             if status < 200 or status >= 300:
-                die(f"HTTP {status} do Millennium (pagina {page}): {raw[:300]}")
-            break  # resposta OK -> sai do retry
+                die(f"HTTP {status} do Millennium ({metodo} pag {page}): {raw[:300]}")
+            break  # resposta OK
 
-        rows = data.get("value") or []  # OData: itens vem em "value" (singular)
+        rows = data.get("value") or []  # OData: itens vem em "value"
         if not rows:
-            break
-
+            return
         max_trans = cursor
         for r in rows:
             try:
@@ -203,29 +194,63 @@ def puxar_estoque() -> list[dict]:
                 t = 0
             if t > max_trans:
                 max_trans = t
-            sku = str(r.get("sku") or "").strip()
-            if not sku or sku in seen:
-                continue
-            seen.add(sku)
-            try:
-                saldo = float(r.get(SALDO_FIELD) or 0)
-            except (TypeError, ValueError):
-                saldo = 0.0
-            item = {"codigo": sku, "estoque": saldo}
-            # codigo do produto (referencia usada na VTEX/ML) e o codigo de barras
-            ref = str(r.get("cod_produto") or "").strip()
-            ean = str(r.get("barra") or "").strip()
-            if ref:
-                item["ref"] = ref
-            if ean:
-                item["ean"] = ean
-            itens.append(item)
-
+            yield r
         if max_trans <= cursor:
-            break
+            return
         cursor = max_trans
 
-    return itens
+
+def puxar_tudo() -> list[dict]:
+    """Junta estoque + preco + nome (3 metodos do Millennium) por SKU."""
+    itens: dict[str, dict] = {}
+
+    # 1) estoque (+ ref/cod_produto + ean/barra)
+    for r in _paginar("produtos/saldodeestoque"):
+        sku = str(r.get("sku") or "").strip()
+        if not sku:
+            continue
+        try:
+            saldo = float(r.get(SALDO_FIELD) or 0)
+        except (TypeError, ValueError):
+            saldo = 0.0
+        it = itens.setdefault(sku, {"codigo": sku})
+        it["estoque"] = saldo
+        ref = str(r.get("cod_produto") or "").strip()
+        ean = str(r.get("barra") or "").strip()
+        if ref:
+            it["ref"] = ref
+        if ean:
+            it["ean"] = ean
+
+    # 2) preco (preco1 = "POR", base para o markup do nosso lado)
+    for r in _paginar("produtos/precodetabela"):
+        sku = str(r.get("sku") or "").strip()
+        if not sku or sku not in itens:
+            continue
+        try:
+            preco = float(r.get("preco1") or 0)
+        except (TypeError, ValueError):
+            preco = 0.0
+        itens[sku]["preco"] = preco
+
+    # 3) nome/descricao (catalogo: produto tem descricao + lista de SKUs)
+    for p in _paginar("produtos/listavitrine"):
+        desc = str(p.get("descricao1") or p.get("descricao_original") or "").strip()
+        skus = p.get("sku") if isinstance(p.get("sku"), list) else []
+        for s in skus:
+            if not isinstance(s, dict):
+                continue
+            sku = str(s.get("sku") or "").strip()
+            if not sku or sku not in itens:
+                continue
+            cor = str(s.get("desc_cor") or "").strip()
+            tam = str(s.get("desc_tamanho") or "").strip()
+            extra = " ".join(x for x in (cor, tam) if x)
+            nome = (desc + (" " + extra if extra else "")).strip()
+            if nome:
+                itens[sku]["nome"] = nome
+
+    return list(itens.values())
 
 
 def empurrar_para_canal(itens: list[dict]) -> None:
@@ -323,8 +348,8 @@ def main():
         f"sink={SINK} dry_run={DRY_RUN}",
         flush=True,
     )
-    itens = puxar_estoque()
-    print(f"[bridge] Millennium retornou {len(itens)} SKUs.", flush=True)
+    itens = puxar_tudo()
+    print(f"[bridge] Millennium retornou {len(itens)} SKUs (estoque+preco+nome).", flush=True)
     if not itens:
         print("[bridge] nada para enviar (0 itens). Verifique vitrine/credenciais.", flush=True)
         return
