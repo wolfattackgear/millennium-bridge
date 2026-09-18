@@ -45,6 +45,12 @@ RES_FILE        = env("RES_FILE", "pedidos_resultado.json")
 
 WORKER_ENABLED  = env("WORKER_ENABLED", "0") not in ("", "0", "false", "False")
 
+# Espelha o 4Middleware: "Cadastrar pedido e posteriormente enviar chamada
+# processastatus aprovando". O pedido do ML já vem pago, então aprovamos (=1,
+# Pagamento Confirmado). O operador ainda separa e FATURA manualmente no ERP.
+USA_PROCESSA    = env("USA_PROCESSA", "1") not in ("", "0", "false", "False")
+APROVAR_STATUS  = int(env("APROVAR_STATUS", "1"))
+
 HTTP_TIMEOUT    = int(env("HTTP_TIMEOUT", "60"))
 NET_RETRIES     = int(env("NET_RETRIES", "3"))
 NET_BACKOFF     = int(env("NET_BACKOFF", "5"))
@@ -184,13 +190,26 @@ def gist_gravar(file: str, obj: dict) -> None:
 
 # ------------------------- Fases -------------------------
 
+def aprovar(cod: str) -> tuple[bool, str]:
+    """processastatus aprovando (status=1, Pagamento Confirmado). Igual 4Middleware."""
+    body = {"vitrine": int(VITRINE or 0), "status_pedidos": [{"cod_pedidov": cod, "status": APROVAR_STATUS}]}
+    st, data, raw = millennium("POST", "pedido_venda/processastatus", body)
+    if st < 200 or st >= 300:
+        return False, f"processastatus HTTP {st}: {raw[:300]}"
+    # o retorno traz acoes[]; se alguma ação for 100 (erro), reporta
+    for a in (data.get("acoes") or []):
+        if a.get("acao") == 100 and a.get("erro"):
+            return False, f"processastatus erro: {str(a.get('erro'))[:250]}"
+    return True, ""
+
+
 def criar(job: dict) -> dict:
-    """METADE 1: cria o pedido de venda no Millennium (se ainda não existe)."""
+    """METADE 1: cadastra o pedido de venda e aprova (processastatus), se ainda não existe."""
     cod = str(job.get("cod_pedidov") or "")
     order_id = str(job.get("order_id") or "")
     res = {"cod_pedidov": cod, "order_id": order_id, "etapa": "inclui"}
 
-    # já existe? (idempotência — não recria)
+    # já existe? (idempotência — não recria nem reaprova)
     pedidov, _status = buscar_pedidov(cod)
     if pedidov:
         log(f"{cod}: já existe no Millennium (pedidov={pedidov}); não recria.")
@@ -199,9 +218,19 @@ def criar(job: dict) -> dict:
     st, data, raw = millennium("POST", "pedido_venda/inclui", job.get("payload") or {})
     if st < 200 or st >= 300:
         return {**res, "fase": "erro", "erro": f"inclui HTTP {st}: {raw[:300]}"}
-    log(f"{cod}: pedido de venda criado (HTTP {st}).")
+    log(f"{cod}: pedido de venda cadastrado (HTTP {st}).")
 
     pedidov, _status = buscar_pedidov(cod)
+
+    # aprovar (processastatus) — pedido do ML já vem pago
+    if USA_PROCESSA:
+        ok, err = aprovar(cod)
+        if not ok:
+            # cadastrou mas não aprovou (licença/rede?). Marca erro; a fila retenta
+            # no próximo ciclo — o inclui é idempotente (buscar_pedidov acha e não recria).
+            return {**res, "etapa": "processastatus", "fase": "erro", "pedidov": pedidov, "erro": err}
+        log(f"{cod}: aprovado (processastatus status={APROVAR_STATUS}).")
+
     return {**res, "fase": "criado", "pedidov": pedidov}
 
 
@@ -279,7 +308,7 @@ def main():
         cod = str(job.get("cod_pedidov") or "")
         status = str(job.get("status") or "pendente")
         try:
-            if status == "pendente":
+            if status in ("pendente", "erro"):
                 r = criar(job)
                 # se criou agora, já tenta colher no mesmo ciclo (caso o operador seja rápido)
                 if r.get("fase") == "criado":

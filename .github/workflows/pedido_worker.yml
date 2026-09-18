@@ -1,17 +1,18 @@
 name: Pedidos ML -> Millennium (criar + colher NF)
 
 # O canal-ml NAO fatura. Este worker:
-#   - cria o pedido de venda no Millennium (pedidos pagos+vinculados);
+#   - cadastra o pedido de venda no Millennium e APROVA (processastatus=1),
+#     igual o 4Middleware ("Cadastrar pedido e posteriormente processastatus aprovando");
 #   - colhe o XML das notas que o OPERADOR ja faturou e devolve pro canal-ml,
 #     que anexa no Mercado Livre.
 #
 # SEGURANCA: WORKER_ENABLED comeca 0 (nao cria nem colhe nada). Ligue o secret
-# WORKER_ENABLED=1 depois de validar os valores (vitrine, tipo_pgto) e o dry-run.
+# WORKER_ENABLED=1 depois de validar o dry-run e os valores (vitrine, tipo_pgto).
 
 on:
-  workflow_dispatch:          # botao "Run workflow" (manual, sob demanda)
+  workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"     # a cada 5 min
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: read
@@ -40,7 +41,8 @@ jobs:
           VITRINE:         ${{ secrets.VITRINE }}
           GIST_PEDIDOS_ID:    ${{ secrets.GIST_PEDIDOS_ID }}
           GIST_PEDIDOS_TOKEN: ${{ secrets.GIST_PEDIDOS_TOKEN }}
-          # 1 liga a criação/colheita de verdade:
           WORKER_ENABLED: ${{ secrets.WORKER_ENABLED }}
+          USA_PROCESSA:   "1"
+          APROVAR_STATUS: "1"
           HTTP_TIMEOUT:   "60"
         run: python pedido_worker.py
