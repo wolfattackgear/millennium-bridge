@@ -235,55 +235,47 @@ def criar(job: dict) -> dict:
 
 
 def colher(job: dict) -> dict | None:
-    """METADE 2: se o operador já faturou, puxa o XML. Senão, mantém 'criado'."""
+    """METADE 2: pergunta direto se o pedido já tem NOTA faturada (listafaturamentos).
+    Evidência direta — não depende do campo 'status' do consultastatus (que vem
+    None logo após criar). Se tem XML => faturado; senão, segue 'criado'."""
     cod = str(job.get("cod_pedidov") or "")
     order_id = str(job.get("order_id") or "")
     pedidov = str(job.get("pedidov") or "")
-    res = {"cod_pedidov": cod, "order_id": order_id, "etapa": "consultastatus"}
+    res = {"cod_pedidov": cod, "order_id": order_id, "etapa": "listafaturamentos", "pedidov": pedidov}
 
-    if not pedidov:
-        pedidov, _ = buscar_pedidov(cod)
-    if not pedidov:
-        return {**res, "fase": "erro", "erro": f"não achei o pedidov do cod {cod} no Millennium."}
-
-    st, data, raw = millennium("GET", "pedido_venda/consultastatus", query=f"list_pedidov=({pedidov})&vitrine={VITRINE}")
-    status = None
-    nota = ""
-    for r in _values(data):
-        if str(r.get("pedidov") or "") == pedidov:
-            status = r.get("status")
-            nota = str(r.get("nfs") or "")
-            break
-
-    if status == STATUS_CANCELADO:
-        return {**res, "fase": "erro", "pedidov": pedidov, "erro": "pedido cancelado no Millennium."}
-    if status != STATUS_FATURADO:
-        log(f"{cod}: aguardando operador faturar (status={status}).")
-        return {**res, "fase": "criado", "pedidov": pedidov}  # segue esperando
-
-    # faturado -> pega XML + chave
     st, data, raw = millennium("GET", "pedido_venda/listafaturamentos", query=f"cod_pedidov={cod}&gera_xml=S&vitrine={VITRINE}")
-    xml = chave = serie = ""
+    xml = chave = serie = nota = ""
     for r in _values(data):
+        if r.get("cancelado"):
+            continue
         if r.get("xml"):
             xml = str(r.get("xml"))
             chave = str(r.get("chave_nf") or "")
             serie = str(r.get("serie_nf") or "")
-            nota = str(r.get("nf") or "") or nota
+            nota = str(r.get("nf") or "")
             break
-    if not xml:
+        # sem xml mas com número de nota? guarda o número (XML pode vir no consultaxmlnfe)
+        if not nota and (r.get("nf") or r.get("chave_nf")):
+            nota = str(r.get("nf") or "")
+            chave = str(r.get("chave_nf") or "")
+
+    # tem nota mas o listafaturamentos não trouxe o XML -> tenta o consultaxmlnfe
+    if not xml and (nota or chave):
         st, data, raw = millennium("GET", "pedido_venda/consultaxmlnfe", query=f"cod_pedidov={cod}")
         for r in _values(data):
             for x in (r.get("xmls") or []):
                 if x.get("xml"):
                     xml = str(x.get("xml"))
                     break
-    if not xml:
-        log(f"{cod}: faturado mas XML ainda indisponível; tenta no próximo ciclo.")
-        return {**res, "fase": "criado", "pedidov": pedidov}
+            if xml:
+                break
 
-    log(f"{cod}: operador faturou; XML obtido ({len(xml)} bytes), chave={chave}.")
-    return {**res, "fase": "faturado", "pedidov": pedidov, "xml": xml, "chave": chave, "serie": serie, "nota": nota}
+    if xml:
+        log(f"{cod}: operador faturou; XML obtido ({len(xml)} bytes), chave={chave}.")
+        return {**res, "fase": "faturado", "pedidov": pedidov, "xml": xml, "chave": chave, "serie": serie, "nota": nota}
+
+    log(f"{cod}: aguardando operador faturar (sem nota ainda).")
+    return {**res, "fase": "criado", "pedidov": pedidov}
 
 
 def main():
