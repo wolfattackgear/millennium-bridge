@@ -1,13 +1,11 @@
 name: Pedidos ML -> Millennium (criar + colher NF)
 
-# O canal-ml NAO fatura. Este worker:
-#   - cadastra o pedido de venda no Millennium e APROVA (processastatus=1),
-#     igual o 4Middleware ("Cadastrar pedido e posteriormente processastatus aprovando");
-#   - colhe o XML das notas que o OPERADOR ja faturou e devolve pro canal-ml,
-#     que anexa no Mercado Livre.
+# O canal-ml NAO fatura. Este worker cadastra o pedido de venda e APROVA
+# (processastatus=1), igual 4Middleware; depois colhe o XML das notas que o
+# OPERADOR ja faturou e devolve pro canal-ml anexar no Mercado Livre.
 #
-# SEGURANCA: WORKER_ENABLED comeca 0 (nao cria nem colhe nada). Ligue o secret
-# WORKER_ENABLED=1 depois de validar o dry-run e os valores (vitrine, tipo_pgto).
+# SEGURANCA: WORKER_ENABLED comeca 0. Ligue o secret WORKER_ENABLED=1 pra valer.
+# Gist: reaproveita o do estoque (GIST_ID/GIST_TOKEN) se GIST_PEDIDOS_* nao existir.
 
 on:
   workflow_dispatch:
@@ -39,8 +37,11 @@ jobs:
           MILLENNIUM_USER: ${{ secrets.MILLENNIUM_USER }}
           MILLENNIUM_PASS: ${{ secrets.MILLENNIUM_PASS }}
           VITRINE:         ${{ secrets.VITRINE }}
+          # Gist dedicado aos pedidos (se existir) OU reaproveita o do estoque:
           GIST_PEDIDOS_ID:    ${{ secrets.GIST_PEDIDOS_ID }}
           GIST_PEDIDOS_TOKEN: ${{ secrets.GIST_PEDIDOS_TOKEN }}
+          GIST_ID:            ${{ secrets.GIST_ID }}
+          GIST_TOKEN:         ${{ secrets.GIST_TOKEN }}
           WORKER_ENABLED: ${{ secrets.WORKER_ENABLED }}
           USA_PROCESSA:   "1"
           APROVAR_STATUS: "1"
