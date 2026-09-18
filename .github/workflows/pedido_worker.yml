@@ -1,16 +1,17 @@
-name: Faturar pedidos ML -> Millennium
+name: Pedidos ML -> Millennium (criar + colher NF)
 
-# Direção de ESCRITA: lê a fila de pedidos (gist), cria/fatura no Millennium e
-# devolve o resultado (com o XML da NF-e) noutro gist. O canal-ml anexa no ML.
+# O canal-ml NAO fatura. Este worker:
+#   - cria o pedido de venda no Millennium (pedidos pagos+vinculados);
+#   - colhe o XML das notas que o OPERADOR ja faturou e devolve pro canal-ml,
+#     que anexa no Mercado Livre.
 #
-# SEGURANÇA: FATURAR_ENABLED começa 0 (modo seguro: não cria/fatura nada).
-# Ligue o secret FATURAR_ENABLED=1 só depois de confirmar a sequência de status
-# com o analista Millennium.
+# SEGURANCA: WORKER_ENABLED comeca 0 (nao cria nem colhe nada). Ligue o secret
+# WORKER_ENABLED=1 depois de validar os valores (vitrine, tipo_pgto) e o dry-run.
 
 on:
-  workflow_dispatch:          # botão "Run workflow" (manual, sob demanda)
+  workflow_dispatch:          # botao "Run workflow" (manual, sob demanda)
   schedule:
-    - cron: "*/5 * * * *"     # a cada 5 min drena a fila
+    - cron: "*/5 * * * *"     # a cada 5 min
 
 permissions:
   contents: read
@@ -20,7 +21,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  faturar:
+  pedidos:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -33,21 +34,13 @@ jobs:
 
       - name: Rodar worker de pedidos
         env:
-          # --- Millennium ---
           MILLENNIUM_URL:  ${{ secrets.MILLENNIUM_URL }}
           MILLENNIUM_USER: ${{ secrets.MILLENNIUM_USER }}
           MILLENNIUM_PASS: ${{ secrets.MILLENNIUM_PASS }}
           VITRINE:         ${{ secrets.VITRINE }}
-          # --- Gist da fila/resultado (pode reusar GIST_ID/GIST_TOKEN do estoque) ---
           GIST_PEDIDOS_ID:    ${{ secrets.GIST_PEDIDOS_ID }}
           GIST_PEDIDOS_TOKEN: ${{ secrets.GIST_PEDIDOS_TOKEN }}
-          # --- Trava de segurança: 1 liga o faturamento real ---
-          FATURAR_ENABLED: ${{ secrets.FATURAR_ENABLED }}
-          # --- Sequência (confirmar com analista); literais seguros ---
-          PROCESSA_STATUS: "1"
-          USA_PROCESSA:    "1"
-          USA_LIBERAR:     "1"
-          POLL_TRIES:      "20"
-          POLL_SLEEP:      "6"
-          HTTP_TIMEOUT:    "60"
+          # 1 liga a criação/colheita de verdade:
+          WORKER_ENABLED: ${{ secrets.WORKER_ENABLED }}
+          HTTP_TIMEOUT:   "60"
         run: python pedido_worker.py
