@@ -354,7 +354,8 @@ def criar(job: dict) -> dict:
         log(f"{cod}: já existe no Millennium (pedidov={pedidov}); não recria.")
         return {**res, "fase": "criado", "pedidov": pedidov}
 
-    log(f"{cod}: enviando inclui ({_resumo_payload(payload)}).")
+    log(f"{cod}: enviando inclui ({_resumo_payload(payload)} pedido_cliente={payload.get('pedido_cliente') or '-'}).")
+    # Corpo do gist vai inteiro ao inclui (pedido_cliente / observacao inclusos).
     st, data, raw = millennium("POST", "pedido_venda/inclui", payload)
     if st < 200 or st >= 300:
         trecho = (raw or "")[:300].replace("\n", " ")
