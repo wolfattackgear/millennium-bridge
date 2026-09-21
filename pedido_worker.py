@@ -203,11 +203,38 @@ def aprovar(cod: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _resumo_payload(payload: dict) -> str:
+    prods = payload.get("produtos") if isinstance(payload, dict) else None
+    skus = []
+    if isinstance(prods, list):
+        for p in prods:
+            if isinstance(p, dict) and p.get("sku"):
+                skus.append(str(p.get("sku")))
+    vit = payload.get("vitrine") if isinstance(payload, dict) else None
+    return f"vitrine={vit} skus={','.join(skus) or '-'}"
+
+
 def criar(job: dict) -> dict:
     """METADE 1: cadastra o pedido de venda e aprova (processastatus), se ainda não existe."""
     cod = str(job.get("cod_pedidov") or "")
     order_id = str(job.get("order_id") or "")
     res = {"cod_pedidov": cod, "order_id": order_id, "etapa": "inclui"}
+    payload = job.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            log(f"{cod}: FALHA inclui — payload não é JSON.")
+            return {**res, "fase": "erro", "erro": "payload do gist não é JSON objeto"}
+    if not isinstance(payload, dict) or not payload:
+        log(f"{cod}: FALHA inclui — payload vazio.")
+        return {**res, "fase": "erro", "erro": "payload vazio"}
+    # vitrine do worker prevalece (evita mismatch com o secret VITRINE)
+    if VITRINE and str(VITRINE) not in ("", "0"):
+        try:
+            payload["vitrine"] = int(VITRINE)
+        except ValueError:
+            payload["vitrine"] = VITRINE
 
     # já existe? (idempotência — não recria nem reaprova)
     pedidov, _status = buscar_pedidov(cod)
@@ -215,8 +242,11 @@ def criar(job: dict) -> dict:
         log(f"{cod}: já existe no Millennium (pedidov={pedidov}); não recria.")
         return {**res, "fase": "criado", "pedidov": pedidov}
 
-    st, data, raw = millennium("POST", "pedido_venda/inclui", job.get("payload") or {})
+    log(f"{cod}: enviando inclui ({_resumo_payload(payload)}).")
+    st, data, raw = millennium("POST", "pedido_venda/inclui", payload)
     if st < 200 or st >= 300:
+        trecho = (raw or "")[:300].replace("\n", " ")
+        log(f"{cod}: FALHA inclui HTTP {st}: {trecho}")
         return {**res, "fase": "erro", "erro": f"inclui HTTP {st}: {raw[:300]}"}
     log(f"{cod}: pedido de venda cadastrado (HTTP {st}).")
 
@@ -296,9 +326,10 @@ def main():
         return
 
     resultados = []
-    for job in jobs:
+    for i, job in enumerate(jobs, 1):
         cod = str(job.get("cod_pedidov") or "")
         status = str(job.get("status") or "pendente")
+        log(f"job {i}/{len(jobs)} {cod} status={status}")
         try:
             if status in ("pendente", "erro"):
                 r = criar(job)
@@ -310,7 +341,10 @@ def main():
             else:  # 'criado' / 'processando'
                 r = colher(job) or {"cod_pedidov": cod, "order_id": str(job.get("order_id") or ""), "fase": "criado"}
         except Exception as e:
+            log(f"{cod}: EXCECAO {type(e).__name__}: {e}")
             r = {"cod_pedidov": cod, "order_id": str(job.get("order_id") or ""), "fase": "erro", "etapa": "excecao", "erro": str(e)}
+        if r.get("fase") == "erro":
+            log(f"{cod}: resultado=erro etapa={r.get('etapa')} {str(r.get('erro') or '')[:200]}")
         resultados.append(r)
 
     gist_gravar(RES_FILE, {
