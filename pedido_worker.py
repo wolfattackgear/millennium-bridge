@@ -27,6 +27,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
 
 
 def env(name: str, default: str = "") -> str:
@@ -127,23 +128,134 @@ def millennium(method: str, metodo: str, payload: dict | None = None, query: str
 
 
 def _values(data: dict) -> list:
-    v = data.get("values")
-    if isinstance(v, list):
+    if not isinstance(data, dict):
+        return []
+    for key in ("values", "value", "faturamentos", "pedidos", "data", "result"):
+        v = data.get(key)
+        if isinstance(v, list):
+            return v
+    return []
+
+
+def _pick(row: dict, *names):
+    if not isinstance(row, dict):
+        return ""
+    lower = {str(k).lower(): v for k, v in row.items()}
+    for n in names:
+        v = lower.get(str(n).lower())
+        if v is None or v == "":
+            continue
         return v
-    v = data.get("value")
-    return v if isinstance(v, list) else []
+    return ""
+
+
+def _norm_cod(c) -> str:
+    d = "".join(ch for ch in str(c or "") if ch.isdigit())
+    return d.lstrip("0") or d
+
+
+def _truthy(v) -> bool:
+    return v in (True, 1, "1", "S", "s", "true", "True", "sim")
+
+
+def _xml_de_row(row: dict) -> str:
+    xml = _pick(row, "xml", "xml_nfe", "xmlnfe", "xml_nf")
+    if isinstance(xml, dict):
+        xml = _pick(xml, "xml", "conteudo", "content")
+    if xml:
+        return str(xml)
+    xmls = row.get("xmls") or row.get("XMLS") or []
+    if isinstance(xmls, list):
+        for x in xmls:
+            if isinstance(x, dict) and (x.get("xml") or x.get("XML")):
+                return str(x.get("xml") or x.get("XML"))
+            if isinstance(x, str) and x.strip().startswith("<"):
+                return x
+    return ""
 
 
 def buscar_pedidov(cod: str) -> tuple[str, object]:
     """Retorna (pedidov, status) do pedido pelo cod_pedidov, ou ('', None)."""
-    st, data, raw = millennium("GET", "pedido_venda/listapedidos", query=f"cod_pedidov={cod}&vitrine={VITRINE}")
-    for r in _values(data):
-        if str(r.get("cod_pedidov") or "") == cod:
-            return str(r.get("pedidov") or ""), r.get("status")
-    vs = _values(data)
-    if vs:
-        return str(vs[0].get("pedidov") or ""), vs[0].get("status")
+    queries = [f"cod_pedidov={cod}"]
+    if VITRINE and VITRINE not in ("0", ""):
+        queries.append(f"cod_pedidov={cod}&vitrine={VITRINE}")
+    for q in queries:
+        st, data, raw = millennium("GET", "pedido_venda/listapedidos", query=q)
+        for r in _values(data):
+            rc = str(_pick(r, "cod_pedidov") or "")
+            if rc == cod or _norm_cod(rc) == _norm_cod(cod):
+                return str(_pick(r, "pedidov") or ""), r.get("status") or _pick(r, "status")
+        vs = _values(data)
+        if vs:
+            return str(_pick(vs[0], "pedidov") or ""), vs[0].get("status")
     return "", None
+
+
+def puxar_xml_nfe(cod: str, pedidov: str = "", nota: str = "", chave: str = "") -> str:
+    queries = [f"cod_pedidov={cod}"]
+    if pedidov:
+        queries.append(f"pedidov={pedidov}")
+    if nota:
+        queries.append(f"nf={nota}")
+    if chave:
+        queries.append(f"chave_nf={chave}")
+    for q in queries:
+        st, data, raw = millennium("GET", "pedido_venda/consultaxmlnfe", query=q)
+        for r in _values(data):
+            xml = _xml_de_row(r) if isinstance(r, dict) else ""
+            if xml:
+                return xml
+            if isinstance(r, dict):
+                for x in (r.get("xmls") or r.get("XMLS") or []):
+                    if isinstance(x, dict) and (x.get("xml") or x.get("XML")):
+                        return str(x.get("xml") or x.get("XML"))
+        xml = _xml_de_row(data) if isinstance(data, dict) else ""
+        if xml:
+            return xml
+    return ""
+
+
+def colher_indice_notas(dias: int = 14) -> dict:
+    """Indexa faturamentos recentes por cod_pedidov (sem zeros à esquerda)."""
+    since = (datetime.utcnow() - timedelta(days=max(1, dias))).strftime("%Y-%m-%d")
+    queries = [
+        f"data_atualizacao={since}&gera_xml=S",
+        f"DATA_ATUALIZACAO={since}&gera_xml=S",
+        f"data_atualizacao={since}",
+        f"DATA_ATUALIZACAO={since}",
+    ]
+    if VITRINE and VITRINE not in ("0", ""):
+        queries.append(f"data_atualizacao={since}&gera_xml=S&vitrine={VITRINE}")
+
+    rows = []
+    used = ""
+    for q in queries:
+        st, data, raw = millennium("GET", "pedido_venda/listafaturamentos", query=q)
+        vs = _values(data)
+        log(f"listafaturamentos HTTP {st} n={len(vs)} q={q}")
+        if vs:
+            rows = vs
+            used = q
+            log("amostra chaves nota=" + ",".join(list(vs[0].keys())[:18]))
+            break
+        if isinstance(data, dict) and st >= 200:
+            log("listafaturamentos chaves resposta=" + ",".join(list(data.keys())[:12]))
+
+    idx = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if _truthy(_pick(r, "cancelado", "cancelada")):
+            continue
+        cod = _norm_cod(_pick(r, "cod_pedidov", "codpedidov", "pedido"))
+        if not cod:
+            continue
+        prev = idx.get(cod)
+        xml = _xml_de_row(r)
+        if prev is None or (xml and not _xml_de_row(prev)):
+            idx[cod] = r
+    log(f"notas indexadas={len(idx)}" + (f" via {used}" if used else " (vazio)"))
+    return idx
 
 
 # ------------------------- Gist -------------------------
@@ -264,44 +376,59 @@ def criar(job: dict) -> dict:
     return {**res, "fase": "criado", "pedidov": pedidov}
 
 
-def colher(job: dict) -> dict | None:
-    """METADE 2: pergunta direto se o pedido já tem NOTA faturada (listafaturamentos).
-    Evidência direta — não depende do campo 'status' do consultastatus (que vem
-    None logo após criar). Se tem XML => faturado; senão, segue 'criado'."""
+def colher(job: dict, indice: dict | None = None) -> dict | None:
+    """METADE 2: se o operador já FATUROU, puxa o XML da NF-e."""
     cod = str(job.get("cod_pedidov") or "")
     order_id = str(job.get("order_id") or "")
     pedidov = str(job.get("pedidov") or "")
     res = {"cod_pedidov": cod, "order_id": order_id, "etapa": "listafaturamentos", "pedidov": pedidov}
 
-    st, data, raw = millennium("GET", "pedido_venda/listafaturamentos", query=f"cod_pedidov={cod}&gera_xml=S&vitrine={VITRINE}")
-    xml = chave = serie = nota = ""
-    for r in _values(data):
-        if r.get("cancelado"):
-            continue
-        if r.get("xml"):
-            xml = str(r.get("xml"))
-            chave = str(r.get("chave_nf") or "")
-            serie = str(r.get("serie_nf") or "")
-            nota = str(r.get("nf") or "")
-            break
-        # sem xml mas com número de nota? guarda o número (XML pode vir no consultaxmlnfe)
-        if not nota and (r.get("nf") or r.get("chave_nf")):
-            nota = str(r.get("nf") or "")
-            chave = str(r.get("chave_nf") or "")
+    row = None
+    if isinstance(indice, dict):
+        row = indice.get(_norm_cod(cod))
 
-    # tem nota mas o listafaturamentos não trouxe o XML -> tenta o consultaxmlnfe
-    if not xml and (nota or chave):
-        st, data, raw = millennium("GET", "pedido_venda/consultaxmlnfe", query=f"cod_pedidov={cod}")
+    # fallback: consulta pontual (alguns tenants só filtram por cod_pedidov)
+    if row is None:
+        st, data, raw = millennium(
+            "GET", "pedido_venda/listafaturamentos",
+            query=f"cod_pedidov={cod}&gera_xml=S",
+        )
         for r in _values(data):
-            for x in (r.get("xmls") or []):
-                if x.get("xml"):
-                    xml = str(x.get("xml"))
-                    break
-            if xml:
+            if isinstance(r, dict) and not _truthy(_pick(r, "cancelado", "cancelada")):
+                row = r
                 break
+        if row is None and st >= 200:
+            log(f"{cod}: listafaturamentos pontual HTTP {st} n={len(_values(data))}")
+
+    xml = chave = serie = nota = ""
+    if isinstance(row, dict):
+        xml = _xml_de_row(row)
+        chave = str(_pick(row, "chave_nf", "chave_nfe", "nfe_chave", "chave") or "")
+        serie = str(_pick(row, "serie_nf", "serie_nfe", "serie") or "")
+        nota = str(_pick(row, "nf", "nota", "nro_nf", "numero_nf") or "")
+        if not pedidov:
+            pedidov = str(_pick(row, "pedidov") or "")
+            res["pedidov"] = pedidov
+
+    if not xml:
+        xml = puxar_xml_nfe(cod, pedidov, nota, chave)
+
+    # pedido já faturado no ERP (status=3) mas a lista não trouxe XML
+    if not xml:
+        pv, stt = buscar_pedidov(cod)
+        if pv:
+            pedidov = pedidov or pv
+            res["pedidov"] = pedidov
+        try:
+            stt_i = int(stt) if stt is not None and str(stt).strip() != "" else None
+        except (TypeError, ValueError):
+            stt_i = None
+        if stt_i == STATUS_FATURADO:
+            log(f"{cod}: listapedidos status=faturado; tentando consultaxmlnfe.")
+            xml = puxar_xml_nfe(cod, pedidov, nota, chave)
 
     if xml:
-        log(f"{cod}: operador faturou; XML obtido ({len(xml)} bytes), chave={chave}.")
+        log(f"{cod}: operador faturou; XML obtido ({len(xml)} bytes), nf={nota} chave={chave}.")
         return {**res, "fase": "faturado", "pedidov": pedidov, "xml": xml, "chave": chave, "serie": serie, "nota": nota}
 
     log(f"{cod}: aguardando operador faturar (sem nota ainda).")
@@ -326,6 +453,7 @@ def main():
         return
 
     resultados = []
+    indice = colher_indice_notas(14)
     for i, job in enumerate(jobs, 1):
         cod = str(job.get("cod_pedidov") or "")
         status = str(job.get("status") or "pendente")
@@ -333,13 +461,12 @@ def main():
         try:
             if status in ("pendente", "erro"):
                 r = criar(job)
-                # se criou agora, já tenta colher no mesmo ciclo (caso o operador seja rápido)
                 if r.get("fase") == "criado":
-                    r2 = colher({**job, "pedidov": r.get("pedidov"), "status": "criado"})
+                    r2 = colher({**job, "pedidov": r.get("pedidov"), "status": "criado"}, indice)
                     if r2 and r2.get("fase") in ("faturado", "erro"):
                         r = r2
             else:  # 'criado' / 'processando'
-                r = colher(job) or {"cod_pedidov": cod, "order_id": str(job.get("order_id") or ""), "fase": "criado"}
+                r = colher(job, indice) or {"cod_pedidov": cod, "order_id": str(job.get("order_id") or ""), "fase": "criado"}
         except Exception as e:
             log(f"{cod}: EXCECAO {type(e).__name__}: {e}")
             r = {"cod_pedidov": cod, "order_id": str(job.get("order_id") or ""), "fase": "erro", "etapa": "excecao", "erro": str(e)}
