@@ -278,7 +278,7 @@ def puxar_tudo() -> list[dict]:
     print(
         f"[bridge] listavitrine: {n_vitrine} SKUs na vitrine, {n_incluir} com incluir. "
         f"campo_incluir={campo_nome or 'NAO'} chaves_sku={chaves_amostra} "
-        f"amostra_sku={json.dumps(amostra_obj, ensure_ascii=False)[:800] if amostra_obj else None}",
+        f"amostra_sku={json.dumps(amostra_obj, ensure_ascii=False)[:800]}",
         flush=True,
     )
     if n_vitrine > 0 and not tem_campo:
