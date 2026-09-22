@@ -200,14 +200,103 @@ def _paginar(metodo: str):
         cursor = max_trans
 
 
+_INCLUIR_KEYS = ("incluir", "incluido", "flag_incluir", "integrar", "enviar")
+# Radicais: o checkbox da guia SKU chama-se "Incluir"; o campo real quase sempre
+# contém "inclu" (ou "integr"). Detecta variantes tipo b_incluir, st_incluir, etc.
+_INCLUIR_STEMS = ("inclu", "integr")
+
+
+def _incluir_key(s: dict):
+    for key in _INCLUIR_KEYS:
+        if key in s:
+            return key
+    for k in s.keys():
+        kn = str(k).strip().lower()
+        if any(st in kn for st in _INCLUIR_STEMS):
+            return k
+    return None
+
+
+def _flag_true(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return float(v) != 0.0
+    s = str(v).strip().upper()
+    return s in ("1", "T", "TRUE", "S", "SIM", "Y", "YES")
+
+
+def sku_marcado_incluir(s: dict) -> bool:
+    """Checkbox 'Incluir' da guia SKU da vitrine — o mesmo que a 4Middleware usava."""
+    k = _incluir_key(s)
+    return _flag_true(s.get(k)) if k is not None else False
+
+
 def puxar_tudo() -> list[dict]:
-    """Junta estoque + preco + nome (3 metodos do Millennium) por SKU."""
+    """Junta estoque + preco + nome por SKU, só os marcados 'Incluir' na vitrine."""
+    catalogo: dict[str, dict] = {}
+    n_vitrine = 0
+    n_incluir = 0
+    tem_campo = False
+    chaves_amostra = None
+    campo_nome = None
+    amostra_obj = None
+
+    # 0) Catálogo da vitrine: só entra SKU com checkbox Incluir (igual 4Middleware).
+    for p in _paginar("produtos/listavitrine"):
+        desc = str(p.get("descricao1") or p.get("descricao_original") or "").strip()
+        skus = p.get("sku") if isinstance(p.get("sku"), list) else []
+        for s in skus:
+            if not isinstance(s, dict):
+                continue
+            n_vitrine += 1
+            if chaves_amostra is None:
+                chaves_amostra = sorted(str(k) for k in s.keys())
+                amostra_obj = {str(k): s.get(k) for k in list(s.keys())[:40]}
+            if _incluir_key(s) is not None:
+                tem_campo = True
+                if campo_nome is None:
+                    campo_nome = _incluir_key(s)
+            marcado = sku_marcado_incluir(s)
+            if marcado:
+                n_incluir += 1
+            sku = str(s.get("sku") or "").strip()
+            if not sku:
+                continue
+            cor = str(s.get("desc_cor") or "").strip()
+            tam = str(s.get("desc_tamanho") or "").strip()
+            extra = " ".join(x for x in (cor, tam) if x)
+            nome = (desc + (" " + extra if extra else "")).strip()
+            catalogo[sku] = {
+                "nome": nome,
+                "ean": str(s.get("barra") or "").strip(),
+                "incluir": marcado,
+            }
+
+    print(
+        f"[bridge] listavitrine: {n_vitrine} SKUs na vitrine, {n_incluir} com incluir. "
+        f"campo_incluir={campo_nome or 'NAO'} chaves_sku={chaves_amostra} "
+        f"amostra_sku={json.dumps(amostra_obj, ensure_ascii=False)[:800] if amostra_obj else None}",
+        flush=True,
+    )
+    if n_vitrine > 0 and not tem_campo:
+        print(
+            "[bridge] AVISO: nenhum SKU trouxe o campo 'incluir'. "
+            "Filtro não aplicado nesta rodada — conferir chaves_sku acima.",
+            flush=True,
+        )
+        permitidos = set(catalogo.keys())
+    else:
+        permitidos = {sku for sku, meta in catalogo.items() if meta.get("incluir")}
+
     itens: dict[str, dict] = {}
 
-    # 1) estoque (+ ref/cod_produto + ean/barra)
+    # 1) estoque (+ ref/cod_produto + ean/barra) — só SKUs permitidos
     for r in _paginar("produtos/saldodeestoque"):
         sku = str(r.get("sku") or "").strip()
-        if not sku:
+        if not sku or sku not in permitidos:
             continue
         try:
             saldo = float(r.get(SALDO_FIELD) or 0)
@@ -233,22 +322,14 @@ def puxar_tudo() -> list[dict]:
             preco = 0.0
         itens[sku]["preco"] = preco
 
-    # 3) nome/descricao (catalogo: produto tem descricao + lista de SKUs)
-    for p in _paginar("produtos/listavitrine"):
-        desc = str(p.get("descricao1") or p.get("descricao_original") or "").strip()
-        skus = p.get("sku") if isinstance(p.get("sku"), list) else []
-        for s in skus:
-            if not isinstance(s, dict):
-                continue
-            sku = str(s.get("sku") or "").strip()
-            if not sku or sku not in itens:
-                continue
-            cor = str(s.get("desc_cor") or "").strip()
-            tam = str(s.get("desc_tamanho") or "").strip()
-            extra = " ".join(x for x in (cor, tam) if x)
-            nome = (desc + (" " + extra if extra else "")).strip()
-            if nome:
-                itens[sku]["nome"] = nome
+    # 3) nome/ean da vitrine + SKUs com incluir mas sem linha de saldo
+    for sku in permitidos:
+        meta = catalogo.get(sku) or {}
+        it = itens.setdefault(sku, {"codigo": sku, "estoque": 0.0})
+        if meta.get("nome"):
+            it["nome"] = meta["nome"]
+        if meta.get("ean") and not it.get("ean"):
+            it["ean"] = meta["ean"]
 
     return list(itens.values())
 
