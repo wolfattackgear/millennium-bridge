@@ -13,7 +13,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  guarda:
+    runs-on: ubuntu-latest
+    outputs:
+      rodar: ${{ steps.chk.outputs.rodar }}
+    steps:
+      - id: chk
+        name: O PC servidor está vivo?
+        run: |
+          STATUS=$(curl -s --max-time 20 \
+            "https://sistema.wolfattack.com.br/projeto/canal-ml/api/agente-status.php?fmt=txt&key=${{ secrets.CRON_SECRET }}" \
+            || echo "MORTO")
+          echo "status=$STATUS"
+          if [ "$STATUS" = "VIVO" ]; then
+            echo "PC vivo — a nuvem NÃO roda (evita sessão dupla no Millennium)."
+            echo "rodar=nao" >> "$GITHUB_OUTPUT"
+          else
+            echo "PC mudo — a nuvem ASSUME."
+            echo "rodar=sim" >> "$GITHUB_OUTPUT"
+          fi
+
   puxar:
+    needs: guarda
+    if: needs.guarda.outputs.rodar == 'sim'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
