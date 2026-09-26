@@ -80,8 +80,36 @@ function Test-CatalogoVenceu {
     return $idade.TotalHours -ge 20
 }
 
+function Update-Repo {
+    # Auto-atualiza o codigo do repositorio a cada volta (deploy sem ir no servidor).
+    # Best-effort: se nao for repo git ou faltar rede/credencial, apenas loga e segue.
+    # OBS: mudancas em .py valem no proximo ciclo (sao chamadas na hora);
+    #      mudancas neste agente.ps1 so valem apos reiniciar o servico.
+    try {
+        Push-Location $base
+        & git rev-parse --is-inside-work-tree 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { Pop-Location; return }
+        & git fetch --quiet origin main 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $localRev  = (& git rev-parse HEAD 2>$null)
+            $remoteRev = (& git rev-parse origin/main 2>$null)
+            if ($localRev -ne $remoteRev) {
+                & git reset --hard origin/main 2>&1 | Out-Null
+                Write-Host "auto-update: atualizado para $remoteRev"
+            }
+        } else {
+            Write-Host "auto-update: git fetch falhou (rede/credencial?) - seguindo com o codigo atual."
+        }
+    } catch {
+        Write-Host "auto-update: erro $_"
+    } finally {
+        Pop-Location
+    }
+}
+
 while ($true) {
     $resumo = @{ ciclo_ok = $true }
+    Update-Repo
     try {
         $cfg = Get-AgenteCfg
         if (-not $cfg) {
