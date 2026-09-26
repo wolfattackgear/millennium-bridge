@@ -44,7 +44,8 @@ GIST_TOKEN      = env("GIST_PEDIDOS_TOKEN", env("GIST_TOKEN"))
 FILA_FILE       = env("FILA_FILE", "pedidos_fila.json")
 RES_FILE        = env("RES_FILE", "pedidos_resultado.json")
 
-WORKER_ENABLED  = env("WORKER_ENABLED", "0") not in ("", "0", "false", "False")
+# Padrão LIGADO (produção). Só desliga se WORKER_ENABLED explicitamente = 0/false.
+WORKER_ENABLED  = env("WORKER_ENABLED", "1") not in ("", "0", "false", "False")
 
 # Espelha o 4Middleware: "Cadastrar pedido e posteriormente enviar chamada
 # processastatus aprovando". O pedido do ML já vem pago, então aprovamos (=1,
@@ -436,6 +437,17 @@ def colher(job: dict, indice: dict | None = None) -> dict | None:
     return {**res, "fase": "criado", "pedidov": pedidov}
 
 
+def gravar_resultado(resultados: list, motivo: str = "ok") -> None:
+    """Sempre grava o resultado no gist (mesmo vazio), pra o card mostrar a hora
+    real da última rodada e o motivo (ok / desligado / idle_sem_fila)."""
+    gist_gravar(RES_FILE, {
+        "gerado_em": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "motivo": motivo,
+        "total": len(resultados),
+        "resultados": resultados,
+    })
+
+
 def main():
     if not GIST_ID or not GIST_TOKEN:
         die("configure GIST_PEDIDOS_ID e GIST_PEDIDOS_TOKEN.")
@@ -445,12 +457,14 @@ def main():
     fila = gist_ler(FILA_FILE) or {}
     jobs = fila.get("jobs") or []
     log(f"início. jobs={len(jobs)} worker_enabled={WORKER_ENABLED} vitrine={VITRINE}")
+    if not WORKER_ENABLED:
+        log("WORKER_ENABLED desligado -> modo seguro: não crio nem colho. "
+            "Ligue WORKER_ENABLED=1 pra valer.")
+        gravar_resultado([], motivo="desligado")
+        return
     if not jobs:
         log("nada na fila.")
-        return
-    if not WORKER_ENABLED:
-        log("WORKER_ENABLED=0 -> modo seguro: não vou criar nem colher nada. "
-            "Ligue WORKER_ENABLED=1 quando validar os valores com o analista.")
+        gravar_resultado([], motivo="idle_sem_fila")
         return
 
     resultados = []
@@ -475,11 +489,7 @@ def main():
             log(f"{cod}: resultado=erro etapa={r.get('etapa')} {str(r.get('erro') or '')[:200]}")
         resultados.append(r)
 
-    gist_gravar(RES_FILE, {
-        "gerado_em": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "total": len(resultados),
-        "resultados": resultados,
-    })
+    gravar_resultado(resultados, motivo="ok")
     criados = sum(1 for r in resultados if r.get("fase") == "criado")
     fat = sum(1 for r in resultados if r.get("fase") == "faturado")
     err = sum(1 for r in resultados if r.get("fase") == "erro")
