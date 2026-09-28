@@ -27,6 +27,28 @@ function Get-PythonExe {
     return $null
 }
 
+function Set-JobEnv($cfg) {
+    # Injeta a config.json como variaveis de ambiente pros workers Python.
+    # pedido_worker.py e puller.py leem TUDO de env; sem isto o worker roda cego.
+    # Assim o robo depende so de agente.ps1 + config.json (sem wrappers .ps1 soltos).
+    if (-not $cfg) { return }
+    $env:MILLENNIUM_URL     = [string]$cfg.millennium_url
+    $env:MILLENNIUM_USER    = [string]$cfg.millennium_user
+    $env:MILLENNIUM_PASS    = [string]$cfg.millennium_pass
+    $env:VITRINE            = [string]$cfg.vitrine
+    $env:CANAL_BASE         = [string]$cfg.canal_base
+    $env:ERP_PUSH_TOKEN     = [string]$cfg.erp_token
+    $env:GIST_PEDIDOS_ID    = [string]$cfg.gist_pedidos_id
+    $env:GIST_PEDIDOS_TOKEN = [string]$cfg.gist_pedidos_token
+    # estoque (puller.py) usa o mesmo gist, arquivo estoque.json (GIST_FILE padrao)
+    $env:GIST_ID            = [string]$cfg.gist_pedidos_id
+    $env:GIST_TOKEN         = [string]$cfg.gist_pedidos_token
+    $env:DRY_RUN            = [string]$cfg.dry_run
+    $we = [string]$cfg.worker_enabled
+    if ($we -eq '') { $we = '1' }   # vazio = ligado (producao)
+    $env:WORKER_ENABLED     = $we
+}
+
 function Send-Heartbeat([hashtable]$extra) {
     $cfg = Get-AgenteCfg
     if (-not $cfg) { return }
@@ -116,6 +138,7 @@ while ($true) {
             $resumo.ciclo_ok = $false
             $resumo.erro = 'sem_config'
         } else {
+            Set-JobEnv $cfg
             if (Test-CatalogoVenceu) {
                 $c = Invoke-JobFile 'millennium-catalogo.ps1' ''
                 if ($null -ne $c) {
