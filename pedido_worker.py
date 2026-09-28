@@ -392,22 +392,39 @@ def colher(job: dict, indice: dict | None = None) -> dict | None:
     pedidov = str(job.get("pedidov") or "")
     res = {"cod_pedidov": cod, "order_id": order_id, "etapa": "listafaturamentos", "pedidov": pedidov}
 
+    # Candidatos: cod curto (12 dig), order_id e pack_id (numero cheio 16 dig).
+    # Alguns pedidos ficam gravados no Millennium com o numero CHEIO do ML
+    # (ex.: criados na 4middleware), entao procuramos por todos os formatos.
+    cands = []
+    for c in (cod, str(job.get("order_id") or ""), str(job.get("pack_id") or "")):
+        c = "".join(ch for ch in c if ch.isdigit())
+        if c and c not in cands:
+            cands.append(c)
+
     row = None
     if isinstance(indice, dict):
-        row = indice.get(_norm_cod(cod))
+        for c in cands:
+            row = indice.get(_norm_cod(c))
+            if row is not None:
+                break
 
     # fallback: consulta pontual (alguns tenants só filtram por cod_pedidov)
     if row is None:
-        st, data, raw = millennium(
-            "GET", "pedido_venda/listafaturamentos",
-            query=f"cod_pedidov={cod}&gera_xml=S",
-        )
-        for r in _values(data):
-            if isinstance(r, dict) and not _truthy(_pick(r, "cancelado", "cancelada")):
-                row = r
+        for c in cands:
+            st, data, raw = millennium(
+                "GET", "pedido_venda/listafaturamentos",
+                query=f"cod_pedidov={c}&gera_xml=S",
+            )
+            achou = None
+            for r in _values(data):
+                if isinstance(r, dict) and not _truthy(_pick(r, "cancelado", "cancelada")):
+                    achou = r
+                    break
+            if achou is not None:
+                row = achou
                 break
-        if row is None and st >= 200:
-            log(f"{cod}: listafaturamentos pontual HTTP {st} n={len(_values(data))}")
+            if st >= 200:
+                log(f"{cod}: listafaturamentos pontual cod={c} HTTP {st} n={len(_values(data))}")
 
     xml = chave = serie = nota = ""
     if isinstance(row, dict):
@@ -419,8 +436,9 @@ def colher(job: dict, indice: dict | None = None) -> dict | None:
             pedidov = str(_pick(row, "pedidov") or "")
             res["pedidov"] = pedidov
 
+    cod_row = str(_pick(row, "cod_pedidov") or cod) if isinstance(row, dict) else cod
     if not xml:
-        xml = puxar_xml_nfe(cod, pedidov, nota, chave)
+        xml = puxar_xml_nfe(cod_row, pedidov, nota, chave)
 
     # pedido já faturado no ERP (status=3) mas a lista não trouxe XML
     if not xml:
