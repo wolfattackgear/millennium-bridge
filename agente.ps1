@@ -37,7 +37,9 @@ function Get-PythonExe {
         'C:\Program Files (x86)\Python*\python.exe',
         'C:\Python*\python.exe',
         "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe",
-        'C:\Users\*\AppData\Local\Programs\Python\Python*\python.exe'
+        'C:\Users\*\AppData\Local\Programs\Python\Python*\python.exe',
+        'C:\Users\*\AppData\Local\Python\pythoncore-*\python.exe',
+        "$env:LOCALAPPDATA\Python\pythoncore-*\python.exe"
     )
     foreach ($g in $globs) {
         $hit = Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1

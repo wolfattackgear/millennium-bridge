@@ -501,7 +501,10 @@ def main():
 
     resultados = []
     try:
-        indice = colher_indice_notas(14)
+        # Varredura pesada (indexa centenas de notas) só quando há muitos jobs.
+        # Com poucos pedidos, a consulta pontual por pedido usa MENOS acessos e
+        # segura a licença por menos tempo — menos briga com os operadores.
+        indice = colher_indice_notas(14) if len(jobs) > 8 else None
         for i, job in enumerate(jobs, 1):
             cod = str(job.get("cod_pedidov") or "")
             status = str(job.get("status") or "pendente")
