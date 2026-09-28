@@ -3,7 +3,7 @@ name: Puxador Millennium -> gist
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "7,27,47 * * * *"   # a cada 20 min (min terminando em 7) - nunca coincide com o pedido
 
 permissions:
   contents: read

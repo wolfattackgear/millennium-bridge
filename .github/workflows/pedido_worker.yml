@@ -10,7 +10,7 @@ name: Pedidos ML -> Millennium (criar + colher NF)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2,12,22,32,42,52 * * * *"   # a cada 10 min (min terminando em 2) - nunca coincide com o estoque
 
 permissions:
   contents: read

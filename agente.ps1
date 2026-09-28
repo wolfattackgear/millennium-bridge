@@ -123,10 +123,14 @@ while ($true) {
                     if ($c -eq 0) { Set-Content -Path (Join-Path $base 'catalogo.stamp') -Value (Get-Date).ToString('o') }
                 }
             }
+            # Millennium = 1 licenca nossa. Rodamos 1 job por vez COM intervalo,
+            # pra a sessao anterior liberar antes do proximo login (evita o "retag"/bloqueio).
             $e = Invoke-JobFile 'millennium-puller.ps1' 'puller.py'
             if ($null -ne $e) { $resumo.estoque = $e }
+            Start-Sleep -Seconds 30
             $p = Invoke-JobFile 'millennium-preco.ps1' ''
             if ($null -ne $p) { $resumo.preco = $p }
+            Start-Sleep -Seconds 30
             $w = Invoke-JobFile 'pedido_worker.ps1' 'pedido_worker.py'
             if ($null -ne $w) { $resumo.pedido = $w }
         }
