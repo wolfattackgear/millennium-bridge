@@ -179,6 +179,15 @@ def _paginar(metodo: str):
                     time.sleep(3)
                     continue
                 die(f"licenca do Millennium ocupada ({metodo} pag {page}) apos varias tentativas.")
+            if status == 401:
+                # 401 = sessao/licenca ocupada ("retag"); credenciais validas.
+                if tent_lic < 5:
+                    tent_lic += 1
+                    print(f"[bridge] sessao ocupada/retag (HTTP 401) em {metodo}, "
+                          f"tentativa {tent_lic}/5, aguardando 5s...", flush=True)
+                    time.sleep(5)
+                    continue
+                die(f"sessao/licenca do Millennium ocupada 401 ({metodo} pag {page}) apos varias tentativas.")
             if status < 200 or status >= 300:
                 die(f"HTTP {status} do Millennium ({metodo} pag {page}): {raw[:300]}")
             break  # resposta OK

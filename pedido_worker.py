@@ -121,6 +121,13 @@ def millennium(method: str, metodo: str, payload: dict | None = None, query: str
             log(f"licença ocupada (HTTP {status}) em {metodo}, tentativa {tent_lic}/5...")
             time.sleep(3)
             continue
+        # 401 aqui = sessao/licenca ocupada ("retag"): credenciais sao validas
+        # (confirmado em teste direto). Trata como ocupado e tenta de novo.
+        if status == 401 and tent_lic < 5:
+            tent_lic += 1
+            log(f"sessao ocupada/retag (HTTP 401) em {metodo}, tentativa {tent_lic}/5...")
+            time.sleep(5)
+            continue
         try:
             parsed = json.loads(body)
         except Exception:
