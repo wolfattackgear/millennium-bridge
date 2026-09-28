@@ -20,9 +20,28 @@ function Get-AgenteCfg {
 }
 
 function Get-PythonExe {
+    # Como SERVICO (NSSM/LocalSystem) o PATH nao tem o Python instalado por usuario.
+    # Procura: cache -> config.json (python_exe) -> PATH -> locais comuns/perfis.
+    if ($script:PyExe -and (Test-Path $script:PyExe)) { return $script:PyExe }
+    $cfg = Get-AgenteCfg
+    if ($cfg -and $cfg.python_exe -and (Test-Path ([string]$cfg.python_exe))) {
+        $script:PyExe = [string]$cfg.python_exe; return $script:PyExe
+    }
     foreach ($n in @('python', 'py', 'python3')) {
         $c = Get-Command $n -ErrorAction SilentlyContinue
-        if ($c) { return $c.Source }
+        if ($c) { $script:PyExe = $c.Source; return $script:PyExe }
+    }
+    $globs = @(
+        'C:\Windows\py.exe',
+        'C:\Program Files\Python*\python.exe',
+        'C:\Program Files (x86)\Python*\python.exe',
+        'C:\Python*\python.exe',
+        "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe",
+        'C:\Users\*\AppData\Local\Programs\Python\Python*\python.exe'
+    )
+    foreach ($g in $globs) {
+        $hit = Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+        if ($hit) { $script:PyExe = $hit.FullName; return $script:PyExe }
     }
     return $null
 }
