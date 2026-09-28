@@ -94,6 +94,11 @@ def _headers() -> dict:
     }
 
 
+class LicencaOcupada(Exception):
+    """Licença/sessão do Millennium ocupada agora — abandona o ciclo e tenta no próximo."""
+    pass
+
+
 def millennium(method: str, metodo: str, payload: dict | None = None, query: str = "") -> tuple[int, dict, str]:
     base = millennium_base()
     url = f"{base}/{metodo}?$format=json" if not query else f"{base}/{metodo}?{query}&$format=json"
@@ -123,11 +128,13 @@ def millennium(method: str, metodo: str, payload: dict | None = None, query: str
             continue
         # 401 aqui = sessao/licenca ocupada ("retag"): credenciais sao validas
         # (confirmado em teste direto). Trata como ocupado e tenta de novo.
-        if status == 401 and tent_lic < 5:
-            tent_lic += 1
-            log(f"sessao ocupada/retag (HTTP 401) em {metodo}, tentativa {tent_lic}/5...")
-            time.sleep(5)
-            continue
+        if status == 401:
+            if tent_lic < 2:
+                tent_lic += 1
+                log(f"sessao ocupada/retag (HTTP 401) em {metodo}, tentativa {tent_lic}/2...")
+                time.sleep(12)
+                continue
+            raise LicencaOcupada(f"401 em {metodo}")
         try:
             parsed = json.loads(body)
         except Exception:
@@ -493,26 +500,33 @@ def main():
         return
 
     resultados = []
-    indice = colher_indice_notas(14)
-    for i, job in enumerate(jobs, 1):
-        cod = str(job.get("cod_pedidov") or "")
-        status = str(job.get("status") or "pendente")
-        log(f"job {i}/{len(jobs)} {cod} status={status}")
-        try:
-            if status in ("pendente", "erro"):
-                r = criar(job)
-                if r.get("fase") == "criado":
-                    r2 = colher({**job, "pedidov": r.get("pedidov"), "status": "criado"}, indice)
-                    if r2 and r2.get("fase") in ("faturado", "erro"):
-                        r = r2
-            else:  # 'criado' / 'processando'
-                r = colher(job, indice) or {"cod_pedidov": cod, "order_id": str(job.get("order_id") or ""), "fase": "criado"}
-        except Exception as e:
-            log(f"{cod}: EXCECAO {type(e).__name__}: {e}")
-            r = {"cod_pedidov": cod, "order_id": str(job.get("order_id") or ""), "fase": "erro", "etapa": "excecao", "erro": str(e)}
-        if r.get("fase") == "erro":
-            log(f"{cod}: resultado=erro etapa={r.get('etapa')} {str(r.get('erro') or '')[:200]}")
-        resultados.append(r)
+    try:
+        indice = colher_indice_notas(14)
+        for i, job in enumerate(jobs, 1):
+            cod = str(job.get("cod_pedidov") or "")
+            status = str(job.get("status") or "pendente")
+            log(f"job {i}/{len(jobs)} {cod} status={status}")
+            try:
+                if status in ("pendente", "erro"):
+                    r = criar(job)
+                    if r.get("fase") == "criado":
+                        r2 = colher({**job, "pedidov": r.get("pedidov"), "status": "criado"}, indice)
+                        if r2 and r2.get("fase") in ("faturado", "erro"):
+                            r = r2
+                else:  # 'criado' / 'processando'
+                    r = colher(job, indice) or {"cod_pedidov": cod, "order_id": str(job.get("order_id") or ""), "fase": "criado"}
+            except LicencaOcupada:
+                raise
+            except Exception as e:
+                log(f"{cod}: EXCECAO {type(e).__name__}: {e}")
+                r = {"cod_pedidov": cod, "order_id": str(job.get("order_id") or ""), "fase": "erro", "etapa": "excecao", "erro": str(e)}
+            if r.get("fase") == "erro":
+                log(f"{cod}: resultado=erro etapa={r.get('etapa')} {str(r.get('erro') or '')[:200]}")
+            resultados.append(r)
+    except LicencaOcupada as e:
+        log(f"licenca ocupada ({e}); abandono este ciclo e tento no proximo (nao martelo a sessao).")
+        gravar_resultado(resultados, motivo="licenca_ocupada")
+        return
 
     gravar_resultado(resultados, motivo="ok")
     criados = sum(1 for r in resultados if r.get("fase") == "criado")
