@@ -330,6 +330,58 @@ def aprovar(cod: str) -> tuple[bool, str]:
     return True, ""
 
 
+def cancelar(cod: str) -> tuple[bool, str]:
+    """processastatus CANCELANDO (status=5). Mesmo mecanismo do aprovar()."""
+    body = {"vitrine": int(VITRINE or 0),
+            "status_pedidos": [{"cod_pedidov": cod, "status": STATUS_CANCELADO}]}
+    st, data, raw = millennium("POST", "pedido_venda/processastatus", body)
+    if st < 200 or st >= 300:
+        return False, f"processastatus(cancelar) HTTP {st}: {raw[:300]}"
+    if isinstance(data, dict):
+        for a in (data.get("acoes") or []):
+            if a.get("acao") == 100 and a.get("erro"):
+                return False, f"processastatus(cancelar) erro: {str(a.get('erro'))[:250]}"
+    return True, ""
+
+
+def cancelar_pedido(job: dict) -> dict:
+    """ML cancelou a venda -> cancela o pedido de venda no Millennium (status=5).
+    Só cancela se o pedido EXISTE e NÃO está faturado (status=3). Se já faturado,
+    devolve 'cancel_bloqueado' pro operador cancelar a NF na mão (evento fiscal)."""
+    cod = str(job.get("cod_pedidov") or "")
+    order_id = str(job.get("order_id") or "")
+    res = {"cod_pedidov": cod, "order_id": order_id, "etapa": "cancelar"}
+
+    pedidov, status = buscar_pedidov(cod)
+    if not pedidov:
+        log(f"{cod}: cancelar — não existe no Millennium; nada a cancelar.")
+        return {**res, "fase": "cancelado",
+                "mensagem": "Pedido não existe no Millennium (nada a cancelar)."}
+
+    try:
+        stt_i = int(status) if status is not None and str(status).strip() != "" else None
+    except (TypeError, ValueError):
+        stt_i = None
+
+    if stt_i == STATUS_FATURADO:
+        log(f"{cod}: cancelar BLOQUEADO — faturado (status=3); NF exige cancelamento fiscal manual.")
+        return {**res, "fase": "cancel_bloqueado", "pedidov": pedidov,
+                "mensagem": "Pedido já faturado no Millennium — cancele a NF-e manualmente (evento fiscal)."}
+
+    if stt_i == STATUS_CANCELADO:
+        log(f"{cod}: já estava cancelado no Millennium (status=5).")
+        return {**res, "fase": "cancelado", "pedidov": pedidov,
+                "mensagem": "Já estava cancelado no Millennium."}
+
+    ok, err = cancelar(cod)
+    if not ok:
+        log(f"{cod}: FALHA cancelar — {err}")
+        return {**res, "fase": "erro", "pedidov": pedidov, "erro": err}
+    log(f"{cod}: cancelado no Millennium (processastatus status={STATUS_CANCELADO}).")
+    return {**res, "fase": "cancelado", "pedidov": pedidov,
+            "mensagem": "Cancelado no Millennium pela integração."}
+
+
 def _resumo_payload(payload: dict) -> str:
     prods = payload.get("produtos") if isinstance(payload, dict) else None
     skus = []
@@ -510,7 +562,9 @@ def main():
             status = str(job.get("status") or "pendente")
             log(f"job {i}/{len(jobs)} {cod} status={status}")
             try:
-                if status in ("pendente", "erro"):
+                if status == "cancelar":
+                    r = cancelar_pedido(job)
+                elif status in ("pendente", "erro"):
                     r = criar(job)
                     if r.get("fase") == "criado":
                         r2 = colher({**job, "pedidov": r.get("pedidov"), "status": "criado"}, indice)
@@ -535,7 +589,8 @@ def main():
     criados = sum(1 for r in resultados if r.get("fase") == "criado")
     fat = sum(1 for r in resultados if r.get("fase") == "faturado")
     err = sum(1 for r in resultados if r.get("fase") == "erro")
-    log(f"FIM. criados/aguardando={criados} faturados={fat} erros={err}")
+    canc = sum(1 for r in resultados if r.get("fase") in ("cancelado", "cancel_bloqueado"))
+    log(f"FIM. criados/aguardando={criados} faturados={fat} cancelados={canc} erros={err}")
 
 
 if __name__ == "__main__":
