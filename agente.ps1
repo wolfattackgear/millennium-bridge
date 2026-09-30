@@ -137,8 +137,16 @@ function Update-Repo {
             $localRev  = (& git rev-parse HEAD 2>$null)
             $remoteRev = (& git rev-parse origin/main 2>$null)
             if ($localRev -ne $remoteRev) {
+                $mudou = (& git diff --name-only $localRev $remoteRev 2>$null)
                 & git reset --hard origin/main 2>&1 | Out-Null
                 Write-Host "auto-update: atualizado para $remoteRev"
+                # Se o PROPRIO agente.ps1 mudou, o processo em memoria ainda e o
+                # antigo -> encerra pra o NSSM reiniciar com a versao nova (auto-reload).
+                if ($mudou -match 'agente\.ps1') {
+                    Write-Host "auto-update: agente.ps1 mudou -> encerrando pro NSSM reiniciar com a versao nova."
+                    Pop-Location
+                    exit 0
+                }
             }
         } else {
             Write-Host "auto-update: git fetch falhou (rede/credencial?) - seguindo com o codigo atual."
