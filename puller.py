@@ -19,6 +19,7 @@ batendo na licenca do Millennium.
 """
 
 import base64
+import calendar
 import json
 import os
 import sys
@@ -61,10 +62,62 @@ GIST_ID         = env("GIST_ID")
 GIST_TOKEN      = env("GIST_TOKEN")
 GIST_FILE       = env("GIST_FILE", "estoque.json")
 
+# Auto-limite (poupa a licenca unica do Millennium):
+#   ESTOQUE_MIN = idade minima do feed pra puxar estoque de novo (min).
+#   PRECO_HORAS = de quanto em quanto tempo puxar preco (h); produto novo puxa na hora.
+#   PULLER_FORCE = 1 forca pull completo agora (ignora o auto-limite).
+ESTOQUE_MIN     = int(env("ESTOQUE_MIN", "15"))
+PRECO_HORAS     = int(env("PRECO_HORAS", "24"))
+PULLER_FORCE    = env("PULLER_FORCE", "0") not in ("", "0", "false", "False")
+CONTROL_FILE    = env("CONTROL_FILE", "estoque_control.json")
+
 
 def die(msg: str, code: int = 1):
     print(f"[bridge] ERRO: {msg}", flush=True)
     sys.exit(code)
+
+
+def _epoch(s) -> float:
+    """ISO 'YYYY-MM-DDTHH:MM:SSZ' -> epoch (0.0 se vazio/invalido)."""
+    s = str(s or "").strip()
+    if not s:
+        return 0.0
+    try:
+        return float(calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")))
+    except Exception:
+        return 0.0
+
+
+def gist_ler_arquivos() -> dict:
+    """Le os arquivos do gist (estoque.json anterior + controle). Best-effort:
+    se faltar rede/credencial, devolve {} e o pull segue sem cache/gate."""
+    if not GIST_ID or not GIST_TOKEN:
+        return {}
+    req = urllib.request.Request(
+        f"https://api.github.com/gists/{GIST_ID}",
+        headers={
+            "Authorization": f"Bearer {GIST_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "WolfBridge-Puller",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        print(f"[bridge] aviso: nao li o gist ({e}); sigo sem cache/auto-limite.", flush=True)
+        return {}
+    out = {}
+    for nome, meta in (data.get("files") or {}).items():
+        cont = (meta or {}).get("content")
+        if not cont:
+            continue
+        try:
+            out[nome] = json.loads(cont)
+        except Exception:
+            out[nome] = {}
+    return out
 
 
 def millennium_base() -> str:
@@ -243,8 +296,13 @@ def sku_marcado_incluir(s: dict) -> bool:
     return _flag_true(s.get(k)) if k is not None else False
 
 
-def puxar_tudo() -> list[dict]:
-    """Junta estoque + preco + nome por SKU, só os marcados 'Incluir' na vitrine."""
+def puxar_tudo(preco_cache: dict | None = None, forcar_preco: bool = False) -> tuple[list[dict], bool]:
+    """Junta estoque + preco + nome por SKU, só os marcados 'Incluir' na vitrine.
+
+    preco_cache: {sku: preco} do feed anterior — evita puxar preço toda rodada.
+    forcar_preco: True puxa precodetabela agora (1x/dia, 'Puxar agora' ou SKU novo).
+    Retorna (itens, preco_foi_puxado)."""
+    preco_cache = preco_cache or {}
     catalogo: dict[str, dict] = {}
     n_vitrine = 0
     n_incluir = 0
@@ -320,16 +378,25 @@ def puxar_tudo() -> list[dict]:
         if ean:
             it["ean"] = ean
 
-    # 2) preco (preco1 = "POR", base para o markup do nosso lado)
-    for r in _paginar("produtos/precodetabela"):
-        sku = str(r.get("sku") or "").strip()
-        if not sku or sku not in itens:
-            continue
-        try:
-            preco = float(r.get("preco1") or 0)
-        except (TypeError, ValueError):
-            preco = 0.0
-        itens[sku]["preco"] = preco
+    # 2) preco (preco1 = "POR", base do markup do nosso lado).
+    #    Preço quase não muda: só puxa se for forçado (1x/dia ou "Puxar agora")
+    #    OU se algum SKU permitido não tem preço em cache (produto novo).
+    precisa_preco = forcar_preco or any(sku not in preco_cache for sku in permitidos)
+    preco_puxado = False
+    if precisa_preco:
+        for r in _paginar("produtos/precodetabela"):
+            sku = str(r.get("sku") or "").strip()
+            if not sku or sku not in itens:
+                continue
+            try:
+                preco = float(r.get("preco1") or 0)
+            except (TypeError, ValueError):
+                preco = 0.0
+            itens[sku]["preco"] = preco
+        preco_puxado = True
+        print(f"[bridge] preco: precodetabela puxado (forcar={forcar_preco}).", flush=True)
+    else:
+        print(f"[bridge] preco: reuso o cache do feed anterior ({len(preco_cache)} SKUs).", flush=True)
 
     # 3) nome/ean da vitrine + SKUs com incluir mas sem linha de saldo
     for sku in permitidos:
@@ -340,7 +407,12 @@ def puxar_tudo() -> list[dict]:
         if meta.get("ean") and not it.get("ean"):
             it["ean"] = meta["ean"]
 
-    return list(itens.values())
+    # Qualquer SKU ainda sem preço nesta rodada herda do cache (ou 0).
+    for sku, it in itens.items():
+        if "preco" not in it:
+            it["preco"] = float(preco_cache.get(sku, 0.0))
+
+    return list(itens.values()), preco_puxado
 
 
 def empurrar_para_canal(itens: list[dict]) -> None:
@@ -376,7 +448,7 @@ def empurrar_para_canal(itens: list[dict]) -> None:
     print(f"[bridge] FIM. total_itens={total} enviados={enviados} dry_run={DRY_RUN}", flush=True)
 
 
-def gravar_no_gist(itens: list[dict]) -> None:
+def gravar_no_gist(itens: list[dict], preco_atualizado_em: str = "") -> None:
     """Fluxo invertido: grava estoque.json num gist secreto via API do GitHub.
     O canal-ml (cron da HostGator) puxa esse gist por HTTPS e aplica o estoque."""
     if not GIST_ID:
@@ -386,6 +458,7 @@ def gravar_no_gist(itens: list[dict]) -> None:
 
     feed = {
         "gerado_em": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "preco_atualizado_em": preco_atualizado_em,
         "vitrine": VITRINE,
         "campo_saldo": SALDO_FIELD,
         "total": len(itens),
@@ -435,19 +508,62 @@ def main():
 
     print(
         f"[bridge] inicio. vitrine={VITRINE} campo_saldo={SALDO_FIELD} "
-        f"sink={SINK} dry_run={DRY_RUN}",
+        f"sink={SINK} dry_run={DRY_RUN} estoque_min={ESTOQUE_MIN} preco_horas={PRECO_HORAS}",
         flush=True,
     )
-    itens = puxar_tudo()
+
+    # Estado anterior (gist): feed de estoque + recado de "Puxar agora".
+    arqs = gist_ler_arquivos() if SINK != "push" else {}
+    prev = arqs.get(GIST_FILE) or {}
+    ctrl = arqs.get(CONTROL_FILE) or {}
+    agora = time.time()
+    prev_gerado = _epoch(prev.get("gerado_em"))
+    force_req = _epoch(ctrl.get("force_req_em"))
+
+    # Forçar: env PULLER_FORCE, ou "Puxar agora" (recado mais novo que o último feed).
+    forcar = PULLER_FORCE or (force_req > 0 and force_req > prev_gerado)
+
+    # Auto-limite do ESTOQUE: feed fresco e sem força -> não puxa (poupa a licença).
+    if not forcar and prev_gerado > 0 and (agora - prev_gerado) < ESTOQUE_MIN * 60:
+        idade = int((agora - prev_gerado) / 60)
+        print(
+            f"[bridge] feed fresco ({idade}min < {ESTOQUE_MIN}min) e sem 'Puxar agora'; "
+            f"pulo o pull (poupa a licenca do Millennium).",
+            flush=True,
+        )
+        return
+
+    # PREÇO: 1x/dia (ou forçado). SKU novo sem cache também puxa (decidido em puxar_tudo).
+    prev_preco = _epoch(prev.get("preco_atualizado_em"))
+    preco_venceu = forcar or prev_preco <= 0 or (agora - prev_preco) >= PRECO_HORAS * 3600
+    preco_cache = {
+        str(it.get("codigo")): float(it.get("preco") or 0)
+        for it in (prev.get("itens") or [])
+        if isinstance(it, dict) and it.get("codigo") and it.get("preco") is not None
+    }
+    print(
+        f"[bridge] modo: forcar={forcar} preco_venceu={preco_venceu} "
+        f"cache_precos={len(preco_cache)} feed_idade_min="
+        f"{int((agora - prev_gerado) / 60) if prev_gerado else 'n/a'}",
+        flush=True,
+    )
+
+    itens, preco_puxado = puxar_tudo(preco_cache, forcar_preco=preco_venceu)
     print(f"[bridge] Millennium retornou {len(itens)} SKUs (estoque+preco+nome).", flush=True)
     if not itens:
         print("[bridge] nada para enviar (0 itens). Verifique vitrine/credenciais.", flush=True)
         return
 
+    # preco_atualizado_em: agora se puxou preço; senão preserva o carimbo anterior.
+    if preco_puxado:
+        preco_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    else:
+        preco_ts = str(prev.get("preco_atualizado_em") or "")
+
     if SINK == "push":
         empurrar_para_canal(itens)
     else:
-        gravar_no_gist(itens)
+        gravar_no_gist(itens, preco_atualizado_em=preco_ts)
 
 
 if __name__ == "__main__":
