@@ -152,6 +152,7 @@ function Update-Repo {
 
 while ($true) {
     $resumo = @{ ciclo_ok = $true }
+    $cicloInicio = Get-Date
     Update-Repo
     try {
         $cfg = Get-AgenteCfg
@@ -184,5 +185,10 @@ while ($true) {
         $resumo.erro = [string]$_
     }
     Send-Heartbeat $resumo
-    Start-Sleep -Seconds 150
+    # Cadencia de 5 min: o pedido (incluir + puxar) roda 1x a cada 5 min. Os 3 jobs
+    # rodam em SEQUENCIA (1 licenca Millennium -> nunca simultaneos), com 60s entre um
+    # e outro. Aqui dormimos so o que falta pra fechar 300s desde o inicio do ciclo.
+    $decorrido = ((Get-Date) - $cicloInicio).TotalSeconds
+    $resto = 300 - $decorrido
+    if ($resto -gt 0) { Start-Sleep -Seconds ([int]$resto) }
 }
