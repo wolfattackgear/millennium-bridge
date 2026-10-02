@@ -193,10 +193,11 @@ while ($true) {
         $resumo.erro = [string]$_
     }
     Send-Heartbeat $resumo
-    # Cadencia de 5 min: o pedido (incluir + puxar) roda 1x a cada 5 min. Os 3 jobs
+    # Cadencia de 3 min: o pedido (incluir + puxar NF) roda 1x a cada 3 min. Os 3 jobs
     # rodam em SEQUENCIA (1 licenca Millennium -> nunca simultaneos), com 60s entre um
-    # e outro. Aqui dormimos so o que falta pra fechar 300s desde o inicio do ciclo.
+    # e outro. Estoque (15min) e preco (diario) se auto-limitam; so o pedido usa os 3 min.
+    # Aqui dormimos so o que falta pra fechar 180s desde o inicio do ciclo.
     $decorrido = ((Get-Date) - $cicloInicio).TotalSeconds
-    $resto = 300 - $decorrido
+    $resto = 180 - $decorrido
     if ($resto -gt 0) { Start-Sleep -Seconds ([int]$resto) }
 }
